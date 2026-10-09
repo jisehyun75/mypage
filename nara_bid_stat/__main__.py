@@ -203,11 +203,22 @@ def _save_tables(tables: dict, out: str) -> None:
     print(f"[ok] {o.resolve()}")
 
 
+_UNSET = object()
+
+
+def _load_inputs(args, prebid: bool = True):
+    """CBF(+복수예가)를 경로 해석(--cbf/NARA_CBF, --prebid-dir/NARA_PREBID/CBF 옆 폴더) 후 읽는다."""
+    cbf = _resolve_cbf(args.cbf)
+    df = _load_cbf(cbf, args.sheet, not args.no_cache)
+    pb = _load_prebid_opt(_resolve_prebid(getattr(args, "prebid_dir", None), cbf), not args.no_cache) if prebid else None
+    return df, pb
+
+
 def cmd_cbf_audit(args, df=None) -> None:
     from .cbf import gap_sample_mask, quality_report, verify_floor_formula, verify_net_cost_rule
     from .competition import fit_model_set, gap_diagnostics
 
-    df = _load_cbf(args.cbf, args.sheet, not args.no_cache) if df is None else df
+    df = _load_inputs(args, prebid=False)[0] if df is None else df
     gaps = df[gap_sample_mask(df)]
     models = fit_model_set(gaps, lam=args.lam)
     tables = {
@@ -227,11 +238,13 @@ def cmd_cbf_audit(args, df=None) -> None:
     _save_tables(tables, args.out)
 
 
-def cmd_backtest(args, df=None, pb=None):
+def cmd_backtest(args, df=None, pb=_UNSET):
     from .strategy import strategy_backtest, summarize_backtest
 
-    df = _load_cbf(args.cbf, args.sheet, not args.no_cache) if df is None else df
-    pb = _load_prebid_opt(args.prebid_dir, not args.no_cache) if pb is None else pb
+    if df is None:
+        df, pb = _load_inputs(args)
+    elif pb is _UNSET:
+        pb = None
     cases = strategy_backtest(df, pb, start=args.start, end=args.end, lam=args.lam, max_cases=args.max_cases,
                               progress=lambda m: print("  " + m, flush=True))
     summ = summarize_backtest(cases)
@@ -248,13 +261,15 @@ def cmd_backtest(args, df=None, pb=None):
     return summ
 
 
-def cmd_consult(args, df=None, pb=None, bt=None) -> None:
+def cmd_consult(args, df=None, pb=_UNSET, bt=None) -> None:
     from pathlib import Path
 
     from .consult import consult, write_consult
 
-    df = _load_cbf(args.cbf, args.sheet, not args.no_cache) if df is None else df
-    pb = _load_prebid_opt(args.prebid_dir, not args.no_cache) if pb is None else pb
+    if df is None:
+        df, pb = _load_inputs(args)
+    elif pb is _UNSET:
+        pb = None
     if bt is None and args.backtest:
         p = Path(args.backtest)
         p = p / "summary.csv" if p.is_dir() else p
@@ -295,26 +310,43 @@ def _resolve_cbf(path) -> str:
     if not path:
         sys.exit("CBF 파일 경로가 필요합니다(--cbf 또는 환경변수 NARA_CBF).")
     p = Path(path)
-    if not p.exists() and Path(path + ".xlsx").exists():  # Windows 가 확장명을 숨겨 'CBF.xlsx.xlsx' 로 저장된 경우
+    if p.is_dir():  # 폴더를 준 경우: 그 안의 CBF.xlsx
+        for name in ("CBF.xlsx", "CBF.xlsx.xlsx"):
+            if (p / name).is_file():
+                print(f"[주의] CBF 경로가 폴더여서 그 안의 {name} 를 사용합니다: {p / name}")
+                return str(p / name)
+        sys.exit(f"CBF 경로가 폴더입니다: {path} - CBF.xlsx 파일 경로를 지정하십시오(--cbf 또는 NARA_CBF).")
+    if not p.exists() and Path(path + ".xlsx").is_file():  # Windows 가 확장명을 숨겨 'CBF.xlsx.xlsx' 로 저장된 경우
         print(f"[주의] {p.name} 대신 {p.name}.xlsx 를 사용합니다(파일 확장명 숨김 설정 때문일 수 있음).")
         return path + ".xlsx"
     return path
 
 
+def _has_xlsx(folder) -> bool:
+    from pathlib import Path
+
+    folder = Path(folder)
+    return any(not q.name.startswith("~$") for pat in ("*.xlsx", "*/*.xlsx") for q in folder.glob(pat))
+
+
 def _resolve_prebid(path, cbf_path: str):
-    """--prebid-dir -> 환경변수 NARA_PREBID -> CBF 옆의 prebid / 복수예가 폴더 순으로 찾는다."""
+    """--prebid-dir -> 환경변수 NARA_PREBID -> CBF 옆의 prebid / 복수예가 폴더 순으로, xlsx 가 있는 폴더를 찾는다."""
     import os
     from pathlib import Path
 
-    path = _clean_path(path) or _clean_path(os.environ.get("NARA_PREBID"))
-    if path:
-        return path
+    given = _clean_path(path) or _clean_path(os.environ.get("NARA_PREBID"))
+    if given:
+        if not Path(given).is_dir():
+            sys.exit(f"복수예가 폴더를 찾을 수 없습니다: {given}")
+        if _has_xlsx(given):
+            return given
+        print(f"[주의] 복수예가 폴더에 xlsx 파일이 없습니다: {given}")
     for name in ("prebid", "복수예가"):
         cand = Path(cbf_path).resolve().parent / name
-        if cand.is_dir():
+        if cand.is_dir() and _has_xlsx(cand) and not (given and cand.resolve() == Path(given).resolve()):
             print(f"[load] 복수예가 폴더 자동 사용: {cand}")
             return str(cand)
-    print("[주의] 복수예가 폴더 없이 분석합니다(--prebid-dir 지정 또는 CBF 옆 prebid 폴더에 넣기). "
+    print("[주의] 복수예가 폴더 없이 분석합니다(--prebid-dir 지정 또는 CBF 옆 prebid 폴더에 xlsx 넣기). "
           "이 경우 사정율 분포는 예가변동폭 이론분포·CBF 이력으로만 만들어집니다.")
     return None
 
@@ -370,15 +402,24 @@ def _pick_row(df: pd.DataFrame, nid: str) -> int:
     return int(pick)
 
 
-def _warn_unknown_org(org: str, source: str, pb) -> None:
-    """직접 입력한 기관의 사정율 분포가 복수예가에서 나오지 않았으면 비슷한 복수예가 기관명을 알려 준다."""
+def _warn_unknown_org(org: str, source: str, pb, asof) -> None:
+    """직접 입력한 기관의 사정율 분포가 복수예가에서 나오지 않았으면 이유(파일 없음/이력 부족)를 알려 준다."""
     import difflib
+
+    from .cbf import org_key
 
     if pb is None or str(source).startswith("복수예가"):
         return
+    k = org_key(org)
+    keys = pb["org"].map(org_key)
+    hit = keys.eq(k) | keys.map(lambda x: len(x) >= 5 and k.endswith(x))
+    if hit.any():
+        n = int((pd.to_datetime(pb.loc[hit, "date"]) < pd.Timestamp(asof).normalize()).sum())
+        print(f"[주의] 기관 '{org}' 의 복수예가 파일은 있으나 개찰일 이전 이력이 {n}건(30건 미만)이라 '{source}' 로 계산했습니다.")
+        return
     names = sorted(set(pb["org"].astype(str)))
     near = [n for n in difflib.get_close_matches(str(org), names, n=5, cutoff=0.5) if n != org]
-    print(f"[주의] 기관명 '{org}' 의 복수예가 이력을 찾지 못해 '{source}' 로 계산했습니다."
+    print(f"[주의] 기관명 '{org}' 의 복수예가 파일을 찾지 못해 '{source}' 로 계산했습니다."
           + (f" 복수예가 파일의 비슷한 기관명: {', '.join(near)}" if near else ""))
 
 
@@ -424,11 +465,13 @@ def cmd_analyze(args) -> None:
         if nid in known:  # CBF 에 있는 공고의 일부 값을 바꿔서 분석(예: 기초금액 공개 후)
             i = _pick_row(df, nid)
             df = df.copy()
-            if "a_value" in manual or "net_cost" in manual:
+            if {"base", "a_value", "net_cost"} & manual.keys():
                 base = manual.get("base", df.at[i, "base"])
-                for k in ("a_value", "net_cost"):
-                    if k in manual and pd.notna(base) and manual[k] >= base:
-                        sys.exit(f"--{k.replace('_', '-')} 이(가) 기초금액보다 큽니다: {manual[k]:,.0f} >= {base:,.0f}")
+                for k, name in (("a_value", "A값"), ("net_cost", "순공사원가")):
+                    v = manual.get(k, df.at[i, k])
+                    if pd.notna(v) and pd.notna(base) and v >= base:
+                        src = "입력한" if k in manual else "CBF 의"
+                        sys.exit(f"{src} {name} {v:,.0f} 이(가) 기초금액 {base:,.0f} 이상입니다. 기초금액·{name}을 확인하십시오.")
             for k, v in manual.items():
                 if k == "date":
                     df.at[i, "open_dt"] = v
@@ -490,7 +533,7 @@ def cmd_analyze(args) -> None:
     print(f"[분석] {', '.join(notices)} (대안 보정 부트스트랩 {args.n_boot}회) ...", flush=True)
     tables = consult(df, pb, rows=rows, lam=args.lam, n_boot=args.n_boot)
     if new_org is not None and "사정율분포_출처" in tables["요약"]:
-        _warn_unknown_org(new_org, tables["요약"]["사정율분포_출처"].iloc[0], pb)
+        _warn_unknown_org(new_org, tables["요약"]["사정율분포_출처"].iloc[0], pb, df.at[rows[0], "date"])
     for card in notice_cards(tables):
         print(card)
     name = "분석_" + (_safe_name("_".join(notices)) if len(notices) <= 3 else f"{_safe_name(notices[0])}_외{len(notices) - 1}건")
@@ -509,8 +552,7 @@ def cmd_run_all(args) -> None:
     from pathlib import Path
 
     out = Path(args.out)
-    df = _load_cbf(args.cbf, args.sheet, not args.no_cache)
-    pb = _load_prebid_opt(args.prebid_dir, not args.no_cache)
+    df, pb = _load_inputs(args)
     a = copy.copy(args)
     a.out = str(out / "1_cbf_audit")
     cmd_cbf_audit(a, df)
@@ -573,7 +615,7 @@ def main(argv=None) -> None:
     n.set_defaults(fn=cmd_nulltest)
 
     c = sub.add_parser("cbf-audit", help="CBF 데이터 품질·산식 검증·경쟁사 모형")
-    c.add_argument("--cbf", required=True)
+    c.add_argument("--cbf", default=None, help="CBF 파일(생략 시 환경변수 NARA_CBF)")
     c.add_argument("--sheet", default="통합데이터")
     c.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
     c.add_argument("--no-cache", action="store_true", help="저장된 표를 쓰지 않고 원본을 다시 읽음")
@@ -581,7 +623,7 @@ def main(argv=None) -> None:
     c.set_defaults(fn=cmd_cbf_audit)
 
     t = sub.add_parser("backtest", help="시간순 전략 백테스트(실제 1순위 금액과 비교)")
-    t.add_argument("--cbf", required=True)
+    t.add_argument("--cbf", default=None, help="CBF 파일(생략 시 환경변수 NARA_CBF)")
     t.add_argument("--sheet", default="통합데이터")
     t.add_argument("--prebid-dir", default=None)
     t.add_argument("--start", default="2025-07-01")
@@ -593,7 +635,7 @@ def main(argv=None) -> None:
     t.set_defaults(fn=cmd_backtest)
 
     k = sub.add_parser("consult", help="개찰 전 공고 컨설팅 보고서(Excel/Markdown)")
-    k.add_argument("--cbf", required=True)
+    k.add_argument("--cbf", default=None, help="CBF 파일(생략 시 환경변수 NARA_CBF)")
     k.add_argument("--sheet", default="통합데이터")
     k.add_argument("--prebid-dir", default=None)
     k.add_argument("--notice", nargs="*", default=None, help="공고번호(생략 시 개찰 전 전체)")
@@ -626,7 +668,7 @@ def main(argv=None) -> None:
     an.set_defaults(fn=cmd_analyze)
 
     ra = sub.add_parser("run-all", help="감사 + 백테스트 + 컨설팅 보고서 한 번에")
-    ra.add_argument("--cbf", required=True)
+    ra.add_argument("--cbf", default=None, help="CBF 파일(생략 시 환경변수 NARA_CBF)")
     ra.add_argument("--sheet", default="통합데이터")
     ra.add_argument("--prebid-dir", default=None)
     ra.add_argument("--notice", nargs="*", default=None)

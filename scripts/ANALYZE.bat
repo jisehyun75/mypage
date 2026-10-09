@@ -26,9 +26,9 @@ pushd "%ROOT%"
 echo [ERROR] Installing numpy, pandas and openpyxl failed. Check the internet connection or proxy and run again.
 goto done
 :have_deps
+rem The prebid folder is found by Python: NARA_PREBID, else a folder named prebid (or the Korean prebid name) next to the CBF file.
 set "ARGS="
 if not defined NARA_CBF set ARGS=--cbf "%ROOT%\data\CBF.xlsx"
-if not defined NARA_PREBID if exist "%ROOT%\data\prebid\" set ARGS=%ARGS% --prebid-dir "%ROOT%\data\prebid"
 set "NOTICES=%*"
 :ask
 if not "%NOTICES%"=="" goto run

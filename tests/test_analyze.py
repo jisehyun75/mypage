@@ -175,8 +175,40 @@ class AnalyzeRobustnessTests(unittest.TestCase):
             finally:
                 del os.environ["NARA_CBF"]
             (Path(tmp) / "복수예가").mkdir()
+            (Path(tmp) / "복수예가" / "기관.xlsx").write_bytes(b"x")
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(Path(_resolve_prebid(None, str(cbf))).name, "복수예가")
+
+
+    def test_base_override_checked_against_cbf_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv = self._csv(tmp)
+            with self.assertRaises(SystemExit) as cm:  # A값(기초금액의 3%)보다 작은 기초금액
+                _run(["analyze", "--cbf", str(csv), "--notice", self.pending, "--base", "1000", "--no-cache",
+                      "--out", str(Path(tmp) / "o")])
+            self.assertIn("CBF 의 A값", str(cm.exception.code))
+
+    def test_path_fallbacks_shared_by_all_commands(self):
+        from nara_bid_stat.__main__ import _resolve_cbf, _resolve_prebid
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "data"
+            (d / "prebid").mkdir(parents=True)  # 비어 있음
+            (d / "복수예가").mkdir()
+            (d / "복수예가" / "기관.xlsx").write_bytes(b"x")
+            cbf = d / "CBF.xlsx"
+            cbf.write_bytes(b"x")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(_resolve_cbf(str(d)), str(cbf))  # 폴더를 주면 그 안의 CBF.xlsx
+                self.assertEqual(Path(_resolve_prebid(str(d / "prebid"), str(cbf))).name, "복수예가")  # 빈 폴더 -> 옆 폴더
+            with self.assertRaises(SystemExit):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _resolve_cbf(str(Path(tmp)))  # CBF.xlsx 없는 폴더
+            csv = self._csv(tmp)
+            out = Path(tmp) / "ra"
+            text = _run(["run-all", "--cbf", str(csv), "--skip-backtest", "--no-cache", "--n-boot", "0", "--out", str(out)])
+            self.assertTrue((out / "3_consult" / "컨설팅_보고서.xlsx").exists())
+            self.assertIn("복수예가 폴더 없이", text)
 
 
 if __name__ == "__main__":
