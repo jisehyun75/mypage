@@ -78,15 +78,19 @@ def cmd_bid(args) -> None:
     print(json.dumps(bid_for_assumed_rate(args.base, args.rate, rule), ensure_ascii=False, indent=2))
 
 
-def read_rate_csv(path) -> tuple[np.ndarray, int]:
-    """경쟁사 사정율 CSV(컬럼 rate, 없으면 첫 컬럼) -> (숫자 사정율 배열, 제외한 행 수). UTF-8/cp949, 천단위 쉼표 허용."""
+def read_rate_csv(path, max_abs: float = 5.0) -> tuple[np.ndarray, int]:
+    """경쟁사 사정율 CSV(컬럼 rate, 없으면 첫 컬럼) -> (사정율 배열, 제외한 행 수). UTF-8/cp949.
+
+    숫자가 아니거나(소수점 쉼표 '0,5' 포함) |값| > max_abs 인 행(금액·% 단위 착오)은 제외하고 개수를 돌려준다.
+    범위 밖 값을 그대로 쓰면 그 경쟁사는 결코 더 낮게 투찰하지 않으므로 낙찰확률이 크게 부풀려진다.
+    """
     try:
-        comp = pd.read_csv(path, encoding="utf-8-sig", thousands=",")
+        comp = pd.read_csv(path, encoding="utf-8-sig")
     except UnicodeDecodeError:  # Excel 에서 저장한 한글 CSV
-        comp = pd.read_csv(path, encoding="cp949", thousands=",")
+        comp = pd.read_csv(path, encoding="cp949")
     col = "rate" if "rate" in comp.columns else comp.columns[0]
     rates = pd.to_numeric(comp[col], errors="coerce").to_numpy(dtype=float)
-    ok = np.isfinite(rates)
+    ok = np.isfinite(rates) & (np.abs(rates) <= max_abs)
     return rates[ok], int((~ok).sum())
 
 
@@ -101,7 +105,7 @@ def cmd_winprob(args) -> None:
     if not len(rates) and args.n > 0:
         raise SystemExit(f"경쟁사 CSV 에 숫자 사정율이 없습니다: {args.competitors}")
     curve = win_probability_curve(dist, rates, args.n)
-    print(f"경쟁사 표본 {len(rates)}개(숫자 아닌 값 {n_bad}개 제외), 참여사 수 가정 {args.n}")
+    print(f"경쟁사 표본 {len(rates)}개(숫자가 아니거나 ±5 를 넘는 값 {n_bad}개 제외), 참여사 수 가정 {args.n}")
     print("(정렬 기준: contested_prob = 다른 유효 투찰이 있을 때의 낙찰확률. sole_prob 는 나만 유효한 경우로 검증 불가)")
     print(best_rates(curve, k=args.top).to_string(index=False))
     n = args.n

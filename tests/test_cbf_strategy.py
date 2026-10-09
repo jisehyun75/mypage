@@ -432,7 +432,7 @@ class Round3RegressionTests(unittest.TestCase):
             grid = float(F.quantile(0.5)) + np.arange(-0.3, 0.3, 0.0037)
             c = win_probability_curve(F, C, n, grid=grid)
             rel = c["cond_prob"].to_numpy() / null_win_prob(C.cdf_left(grid), n) - 1
-            self.assertLess(np.max(np.abs(rel)), 0.002, (band, n))
+            self.assertLess(np.max(np.abs(rel)), 5e-4, (band, n))
             rec = recommend({"base": 1e8, "lower_rate": 87.745}, F, null_competitor_model(band), np.array([n]))
             self.assertEqual(rec["best_rate"], rec["median_rate"], (band, n))  # 평평한 곡선 -> 중앙값
 
@@ -504,10 +504,10 @@ class Round3RegressionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "c.csv"
-            p.write_bytes("사정율\n0.1\n-0.2\n\n abc\n0.5\n".encode("cp949"))
+            p.write_bytes('사정율\n0.1\n-0.2\n\n abc\n0.5\n"0,5"\n"1,234,567"\n'.encode("cp949"))
             rates, bad = read_rate_csv(p)
             np.testing.assert_allclose(rates, [0.1, -0.2, 0.5])
-            self.assertEqual(bad, 1)
+            self.assertEqual(bad, 3)  # 비숫자, 소수점 쉼표, 금액
 
     def test_lambda_default_row_marked_chosen(self):
         from nara_bid_stat.competition import select_lambda
