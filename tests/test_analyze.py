@@ -1,0 +1,117 @@
+import contextlib
+import io
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from nara_bid_stat.__main__ import main
+from nara_bid_stat.cache import cached_frame
+from nara_bid_stat.cbf import manual_notice_row, quality_report, standardize_cbf
+from nara_bid_stat.consult import consult, notice_cards
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from synthetic_cbf import make_raw_cbf  # noqa: E402
+
+
+def _run(argv) -> str:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(argv)
+    return buf.getvalue()
+
+
+class CacheTests(unittest.TestCase):
+    def test_cached_frame_reuses_and_refreshes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.txt"
+            src.write_text("a")
+            calls = []
+
+            def build():
+                calls.append(1)
+                return pd.DataFrame({"x": [len(calls)]})
+
+            d = Path(tmp) / "cache"
+            a = cached_frame("t", "origin", [src], build, cache_dir=d)
+            b = cached_frame("t", "origin", [src], build, cache_dir=d)
+            self.assertEqual(len(calls), 1)
+            pd.testing.assert_frame_equal(a, b)
+            time.sleep(0.01)
+            src.write_text("bb")  # 원본이 바뀌면 다시 만든다
+            os.utime(src, ns=(time.time_ns(), time.time_ns() + 10**9))
+            c = cached_frame("t", "origin", [src], build, cache_dir=d)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(int(c["x"].iloc[0]), 2)
+            self.assertEqual(len(list(d.glob("t_*.pkl"))), 1)  # 예전 캐시 정리
+            next(d.glob("t_*.pkl")).write_bytes(b"broken")  # 손상된 캐시 -> 다시 만든다
+            cached_frame("t", "origin", [src], build, cache_dir=d)
+            self.assertEqual(len(calls), 3)
+
+
+class AnalyzeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.raw = make_raw_cbf(700, seed=31, n_pending=2)
+        cls.df = standardize_cbf(cls.raw)
+
+    def test_manual_notice_row_is_consistent(self):
+        row = manual_notice_row(self.df.columns, notice="NEW-1", org="충청북도 가상시", base=1e8, lower_rate=87.745,
+                                band=3, open_dt="2026-07-01 11:00", a_value=3e6, industry="전기")
+        self.assertEqual(list(row.columns[: len(self.df.columns)]), list(self.df.columns))
+        both = pd.concat([self.df, row], ignore_index=True)
+        quality_report(both)  # 개찰 전 행이 섞여도 동작
+        t = consult(both, None, notices=["NEW-1"], n_boot=0)
+        r = t["요약"].iloc[0]
+        self.assertEqual(r["공고번호"], "NEW-1")
+        self.assertTrue(np.isfinite(r["기본추천_사정율"]) and r["기본추천_투찰금액"] > 0)
+        with self.assertRaises(ValueError):
+            manual_notice_row(self.df.columns, notice="X", org="a", base=-1, lower_rate=87.7, band=3, open_dt="2026-07-01")
+        with self.assertRaises(ValueError):
+            manual_notice_row(self.df.columns, notice="X", org="a", base=1e8, lower_rate=87.7, band=3, open_dt="2026-13-45")
+
+    def test_best10_and_actual_result(self):
+        done = self.df[self.df["status"].eq("COMPLETED") & (self.df["date"] >= "2026-03-01")].iloc[0]
+        t = consult(self.df, None, notices=[done["notice"]], n_boot=0)
+        b = t["BEST10"]
+        self.assertEqual(len(b), 10)
+        self.assertTrue((b["누적확률"].diff().dropna() > 0).all())
+        r = t["요약"].iloc[0]
+        self.assertAlmostEqual(r["BEST10_적중확률"], b["누적확률"].iloc[-1])
+        self.assertAlmostEqual(r["실제_사정율"], done["rate"])
+        self.assertIn(bool(r["BEST10_적중"]), (True, False))
+        self.assertIn("실제결과_기본추천낙찰", r.index)
+        card = notice_cards(t)[0]
+        self.assertIn("BEST10", card)
+        self.assertIn("최종 추천 사정율", card)
+        self.assertIn("실제 사정율", card)
+
+    def test_cli_notice_manual_and_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv = Path(tmp) / "cbf.csv"
+            self.raw.to_csv(csv, index=False, encoding="utf-8-sig")
+            pend = self.df.loc[self.df["status"].eq("PENDING"), "notice"].tolist()
+            out = Path(tmp) / "out"
+            text = _run(["analyze", "--cbf", str(csv), "--notice", pend[0], "--n-boot", "0", "--no-cache", "--out", str(out)])
+            self.assertIn("최종 추천 사정율(투찰용)", text)
+            self.assertTrue((out / f"분석_{pend[0]}.xlsx").exists())
+            text = _run(["analyze", "--cbf", str(csv), "--list", "--no-cache"])
+            self.assertIn(pend[0], text)
+            text = _run(["analyze", "--cbf", str(csv), "--notice", "NEW-2", "--org", "충청북도 가상시", "--industry", "전기",
+                         "--base", "123456000", "--lower-rate", "87.745", "--a-value", "3700000", "--band=-3/+3",
+                         "--date", "2026-07-02 11:00", "--n-boot", "0", "--no-cache", "--out", str(out)])
+            self.assertIn("NEW-2", text)
+            self.assertTrue((out / "분석_NEW-2.xlsx").exists())
+            with self.assertRaises(SystemExit):
+                _run(["analyze", "--cbf", str(csv), "--notice", "NO-SUCH", "--no-cache", "--out", str(out)])
+            with self.assertRaises(SystemExit):  # 직접 입력 필수값 누락
+                _run(["analyze", "--cbf", str(csv), "--notice", "NEW-3", "--org", "x", "--no-cache", "--out", str(out)])
+
+
+if __name__ == "__main__":
+    unittest.main()

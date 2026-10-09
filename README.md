@@ -17,6 +17,22 @@ pip install -r requirements.txt
 python -m unittest discover -s tests      # 89개 테스트(합성 데이터)
 ```
 
+## 공고 하나 분석 (BEST10 + 최종 추천 사정율)
+
+```bash
+python -m nara_bid_stat analyze --cbf CBF.xlsx --prebid-dir 복수예가 --notice R26BK01740091-000
+python -m nara_bid_stat analyze --cbf CBF.xlsx --list          # 개찰 전 공고 목록
+```
+
+공고번호를 넣으면 그 공고의 개찰일 **이전** 자료만으로 사정율 분포·경쟁사 모형·예상 업체수를 그 자리에서 계산해
+**BEST10**(0.1 구간 10개와 확률), **최종 추천 사정율**(투찰용, 사정율 분포 중앙값)과 투찰금액·낙찰확률, 경쟁사 모형 대안을 출력하고
+`분석결과/분석_공고번호.xlsx·md` 로 저장합니다. CBF 에 없는 새 공고는 `--org --base --lower-rate --band --date` 로 직접 입력합니다.
+이미 개찰된 공고를 넣으면 실제 결과(BEST10 적중, 추천대로 투찰했다면 낙찰 여부)도 함께 보여 줍니다.
+읽은 데이터는 캐시되어 두 번째 실행부터 빠릅니다.
+
+**Windows 데스크톱:** `scripts\ANALYZE.bat` 더블클릭 → 공고번호 입력. 설치부터 출력 읽는 법까지는
+[docs/RUN_WINDOWS_KO.md](docs/RUN_WINDOWS_KO.md) 를 보십시오.
+
 ## 한 번에 실행
 
 ```bash
@@ -106,11 +122,13 @@ nara_bid_stat/
   bid.py          통일 투찰 산식, 투찰금액 -> 유효 상한 사정율, 낙찰확률 곡선(결정적 구적), 효율적 시장 공식
   competition.py  1순위 간격 우도로 경쟁사 분포 추정(벌점 최대우도, lambda 자동 선택, 귀무모형), 진단
   strategy.py     공고별 사정율 분포·업체수·추천, 시간순 전략 백테스트와 요약 검정
-  consult.py      개찰 전 공고 컨설팅 보고서(Excel/Markdown)
+  consult.py      개찰 전 공고 컨설팅 보고서(Excel/Markdown), 공고별 BEST10·화면 요약
+  cache.py        읽은 CBF·복수예가 표 캐시(원본이 바뀌면 자동 갱신)
   scoring.py      CRPS, PIT, 구간적중, Wilson CI, 이항검정, Diebold-Mariano, KS
   walkforward.py  사정율 분포 워크포워드 검증, 기존 엔진 BEST-k 장부 평가(McNemar)
   audit.py        복수예가 데이터 감사, 튜닝 절차 귀무 시뮬레이션
-scripts/RUN_ALL.bat   Windows 일괄 실행
+scripts/ANALYZE.bat   Windows: 공고번호 입력 -> BEST10 + 최종 추천 사정율
+scripts/RUN_ALL.bat   Windows: 점검 + 백테스트 + 전체 보고서 일괄 실행
 tests/                unittest 89개(합성 데이터)
 docs/                 방법론과 검증 근거
 ```

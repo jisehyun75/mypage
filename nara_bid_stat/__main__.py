@@ -11,6 +11,13 @@
     python -m nara_bid_stat backtest  --cbf CBF.xlsx --prebid-dir 복수예가 --start 2025-07-01 --out backtest_out
     python -m nara_bid_stat consult   --cbf CBF.xlsx --prebid-dir 복수예가 --backtest backtest_out --out consult_out
     python -m nara_bid_stat run-all   --cbf CBF.xlsx --prebid-dir 복수예가 --out 결과      # 위 셋을 한 번에
+
+    # 공고 하나(또는 몇 개) 분석: BEST10 + 최종 추천 사정율·투찰금액·낙찰확률
+    python -m nara_bid_stat analyze --cbf CBF.xlsx --prebid-dir 복수예가 --notice R26BK01740091-000
+    python -m nara_bid_stat analyze --cbf CBF.xlsx --list                                  # 개찰 전 공고 목록
+    python -m nara_bid_stat analyze --cbf CBF.xlsx --prebid-dir 복수예가 --notice 새공고 \
+        --org "충청북도 청주시" --industry 전기 --base 312450000 --lower-rate 89.745 --a-value 12340000 \
+        --band 3 --date "2026-10-12 11:00"                                            # CBF 에 없는 공고 직접 입력
 """
 from __future__ import annotations
 
@@ -142,21 +149,37 @@ def _lam_arg(v: str):
     return x
 
 
-def _load_cbf(path: str, sheet: str):
+def _load_cbf(path: str, sheet: str, cache: bool = True):
+    from pathlib import Path
+
+    from .cache import cached_frame
     from .cbf import load_cbf
 
     print(f"[load] CBF {path} (시트 {sheet}) ...", flush=True)
-    df = load_cbf(path, sheet=sheet)
+    if not Path(path).exists():
+        sys.exit(f"CBF 파일을 찾을 수 없습니다: {path}")
+    build = lambda: load_cbf(path, sheet=sheet)  # noqa: E731
+    df = cached_frame("cbf", f"{Path(path).resolve()}|{sheet}", [path], build,
+                      log=lambda m: print(m, flush=True)) if cache else build()
     print(f"[load] {len(df):,}건, 완료 {int(df['status'].eq('COMPLETED').sum()):,} / 개찰 전 {int(df['status'].eq('PENDING').sum())}", flush=True)
     return df
 
 
-def _load_prebid_opt(path):
+def _load_prebid_opt(path, cache: bool = True):
     if not path:
         return None
+    from pathlib import Path
+
+    from .cache import cached_frame
     from .data import load_prebid_folder
 
-    pb = load_prebid_folder(path)
+    folder = Path(path)
+    if not folder.is_dir():
+        sys.exit(f"복수예가 폴더를 찾을 수 없습니다: {path}")
+    files = sorted(p for p in folder.glob("*.xlsx") if not p.name.startswith("~$"))
+    build = lambda: load_prebid_folder(path)  # noqa: E731
+    pb = cached_frame("prebid", str(folder.resolve()), files, build,
+                      log=lambda m: print(m, flush=True)) if cache and files else build()
     print(f"[load] 복수예가 {len(pb):,}건 / 기관 {pb['org'].nunique()}곳", flush=True)
     return pb
 
@@ -175,7 +198,7 @@ def cmd_cbf_audit(args, df=None) -> None:
     from .cbf import gap_sample_mask, quality_report, verify_floor_formula, verify_net_cost_rule
     from .competition import fit_model_set, gap_diagnostics
 
-    df = _load_cbf(args.cbf, args.sheet) if df is None else df
+    df = _load_cbf(args.cbf, args.sheet, not args.no_cache) if df is None else df
     gaps = df[gap_sample_mask(df)]
     models = fit_model_set(gaps, lam=args.lam)
     tables = {
@@ -198,8 +221,8 @@ def cmd_cbf_audit(args, df=None) -> None:
 def cmd_backtest(args, df=None, pb=None):
     from .strategy import strategy_backtest, summarize_backtest
 
-    df = _load_cbf(args.cbf, args.sheet) if df is None else df
-    pb = _load_prebid_opt(args.prebid_dir) if pb is None else pb
+    df = _load_cbf(args.cbf, args.sheet, not args.no_cache) if df is None else df
+    pb = _load_prebid_opt(args.prebid_dir, not args.no_cache) if pb is None else pb
     cases = strategy_backtest(df, pb, start=args.start, end=args.end, lam=args.lam, max_cases=args.max_cases,
                               progress=lambda m: print("  " + m, flush=True))
     summ = summarize_backtest(cases)
@@ -221,8 +244,8 @@ def cmd_consult(args, df=None, pb=None, bt=None) -> None:
 
     from .consult import consult, write_consult
 
-    df = _load_cbf(args.cbf, args.sheet) if df is None else df
-    pb = _load_prebid_opt(args.prebid_dir) if pb is None else pb
+    df = _load_cbf(args.cbf, args.sheet, not args.no_cache) if df is None else df
+    pb = _load_prebid_opt(args.prebid_dir, not args.no_cache) if pb is None else pb
     if bt is None and args.backtest:
         p = Path(args.backtest)
         p = p / "summary.csv" if p.is_dir() else p
@@ -236,14 +259,117 @@ def cmd_consult(args, df=None, pb=None, bt=None) -> None:
     print(f"[ok] {paths['xlsx']}\n[ok] {paths['md']}")
 
 
+_OVERRIDE_COLS = ("org", "industry", "base", "lower_rate", "a_value", "net_cost", "band", "date", "est_price")
+
+
+def _safe_name(text: str) -> str:
+    import re
+
+    return re.sub(r'[\\/:*?"<>|\s]+', "_", text).strip("_")[:80] or "분석"
+
+
+def cmd_analyze(args) -> None:
+    """공고번호(또는 직접 입력한 공고)를 분석해 BEST10 과 최종 추천 사정율을 출력·저장한다."""
+    from pathlib import Path
+
+    from .cbf import industry_group, manual_notice_row, org_key, parse_band
+    from .consult import consult, notice_cards, write_consult
+
+    df = _load_cbf(args.cbf, args.sheet, not args.no_cache)
+    if args.list:
+        p = df[df["status"].eq("PENDING")].sort_values("open_dt", kind="mergesort")
+        cols = ["notice", "org", "industry", "open_dt", "base", "lower_rate", "a_value", "band"]
+        print(f"개찰 전 공고 {len(p)}건" + ("" if len(p) else " (CBF 에 PENDING 공고가 없습니다)"))
+        if len(p):
+            p = p.assign(**{c: p[c].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "-") for c in ("base", "a_value")})
+            print(p[cols].rename(columns={"notice": "공고번호", "org": "발주기관", "industry": "업종", "open_dt": "개찰일시",
+                                          "base": "기초금액", "lower_rate": "하한율", "a_value": "A값", "band": "변동폭"}
+                                 ).to_string(index=False))
+        return
+    manual = {k: getattr(args, k) for k in _OVERRIDE_COLS if getattr(args, k) is not None}
+    notices = [n.strip() for n in (args.notice or []) if n.strip()]
+    if not notices and not manual:
+        if sys.stdin is not None and sys.stdin.isatty():
+            notices = input("공고번호를 입력하세요(여러 개는 띄어쓰기로 구분): ").split()
+        if not notices:
+            sys.exit("공고번호(--notice) 또는 직접 입력 항목(--org --base --lower-rate --band --date)이 필요합니다. "
+                     "개찰 전 공고 목록은 --list 로 볼 수 있습니다.")
+    known = set(df["notice"].astype(str))
+    if manual:
+        if len(notices) > 1:
+            sys.exit("직접 입력 항목(--org, --base 등)은 공고 하나에만 쓸 수 있습니다.")
+        nid = notices[0] if notices else "직접입력"
+        notices = [nid]
+        if nid in known:  # CBF 에 있는 공고의 일부 값을 바꿔서 분석(예: 기초금액 공개 후)
+            m = df["notice"].astype(str).eq(nid)
+            df = df.copy()
+            for k, v in manual.items():
+                if k == "date":
+                    odt = pd.to_datetime(v, errors="coerce")
+                    if pd.isna(odt):
+                        sys.exit(f"개찰일을 읽을 수 없습니다: {v}")
+                    df.loc[m, "open_dt"] = odt
+                    df.loc[m, "date"] = odt.normalize()
+                elif k == "org":
+                    df.loc[m, "org"] = v
+                    df.loc[m, "org_key"] = org_key(v)
+                elif k == "industry":
+                    df.loc[m, "industry"] = v
+                    df.loc[m, "industry_group"] = industry_group(v)
+                else:
+                    df.loc[m, k] = float(v)
+            print(f"[입력] {nid}: CBF 값 중 {', '.join(manual)} 을(를) 입력값으로 바꿔 분석합니다.")
+        else:
+            need = [k for k in ("org", "base", "lower_rate", "band", "date") if k not in manual]
+            if need:
+                flags = ", ".join("--" + k.replace("_", "-") for k in need)
+                sys.exit(f"CBF 에 없는 공고 '{nid}' 를 직접 입력하려면 {flags} 도 필요합니다.")
+            try:
+                row = manual_notice_row(df.columns, notice=nid, org=manual["org"], base=manual["base"],
+                                        lower_rate=manual["lower_rate"], band=parse_band(manual["band"]),
+                                        open_dt=manual["date"], a_value=manual.get("a_value"),
+                                        net_cost=manual.get("net_cost"), industry=manual.get("industry", ""),
+                                        est_price=manual.get("est_price"))
+            except ValueError as e:
+                sys.exit(str(e))
+            df = pd.concat([df, row], ignore_index=True)
+            print(f"[입력] {nid}: CBF 에 없는 공고를 직접 입력값으로 분석합니다.")
+    else:
+        missing = [n for n in notices if n not in known]
+        if missing:
+            import difflib
+
+            for n in missing:
+                near = difflib.get_close_matches(n, sorted(known), n=5, cutoff=0.75)
+                hint = f" 비슷한 번호: {', '.join(near)}" if near else ""
+                print(f"[없음] '{n}' 은(는) CBF 에 없습니다.{hint}")
+            notices = [n for n in notices if n in known]
+            if not notices:
+                sys.exit("CBF 에 없는 공고는 --org --base --lower-rate --band --date (필요하면 --a-value --net-cost --industry)로 "
+                         "직접 입력해 분석할 수 있습니다.")
+    pb = _load_prebid_opt(args.prebid_dir, not args.no_cache)
+    print(f"[분석] {', '.join(notices)} (대안 보정 부트스트랩 {args.n_boot}회) ...", flush=True)
+    tables = consult(df, pb, notices=notices, lam=args.lam, n_boot=args.n_boot)
+    for card in notice_cards(tables):
+        print(card)
+    name = "분석_" + (_safe_name("_".join(notices)) if len(notices) <= 3 else f"{_safe_name(notices[0])}_외{len(notices) - 1}건")
+    try:
+        paths = write_consult(tables, args.out, name=name)
+    except PermissionError as e:  # 같은 이름의 결과 파일이 Excel 에서 열려 있음
+        sys.exit(f"결과 파일을 저장하지 못했습니다({e.filename}). Excel 에서 열려 있으면 닫고 다시 실행하십시오. "
+                 "(분석 결과는 위 화면 출력과 같습니다)")
+    print("=" * 72)
+    print(f"[저장] {Path(paths['xlsx']).resolve()}\n[저장] {Path(paths['md']).resolve()}")
+
+
 def cmd_run_all(args) -> None:
     """CBF·복수예가를 한 번만 읽고 감사 -> (백테스트) -> 컨설팅 보고서를 순서대로 만든다."""
     import copy
     from pathlib import Path
 
     out = Path(args.out)
-    df = _load_cbf(args.cbf, args.sheet)
-    pb = _load_prebid_opt(args.prebid_dir)
+    df = _load_cbf(args.cbf, args.sheet, not args.no_cache)
+    pb = _load_prebid_opt(args.prebid_dir, not args.no_cache)
     a = copy.copy(args)
     a.out = str(out / "1_cbf_audit")
     cmd_cbf_audit(a, df)
@@ -309,6 +435,7 @@ def main(argv=None) -> None:
     c.add_argument("--cbf", required=True)
     c.add_argument("--sheet", default="통합데이터")
     c.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
+    c.add_argument("--no-cache", action="store_true", help="저장된 표를 쓰지 않고 원본을 다시 읽음")
     c.add_argument("--out", default="cbf_audit")
     c.set_defaults(fn=cmd_cbf_audit)
 
@@ -320,6 +447,7 @@ def main(argv=None) -> None:
     t.add_argument("--end", default=None)
     t.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
     t.add_argument("--max-cases", type=int, default=None)
+    t.add_argument("--no-cache", action="store_true", help="저장된 표를 쓰지 않고 원본을 다시 읽음")
     t.add_argument("--out", default="backtest_out")
     t.set_defaults(fn=cmd_backtest)
 
@@ -331,8 +459,30 @@ def main(argv=None) -> None:
     k.add_argument("--backtest", default=None, help="backtest 출력 폴더 또는 summary.csv")
     k.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
     k.add_argument("--n-boot", type=_nonneg_int, default=30, help="대안(경쟁사 모형) 낙찰확률 선택 편향 보정 부트스트랩 횟수(0: 대안 생략)")
+    k.add_argument("--no-cache", action="store_true", help="저장된 표를 쓰지 않고 원본을 다시 읽음")
     k.add_argument("--out", default="consult_out")
     k.set_defaults(fn=cmd_consult)
+
+    an = sub.add_parser("analyze", help="공고 하나(또는 몇 개) 분석: BEST10 + 최종 추천 사정율·투찰금액·낙찰확률")
+    an.add_argument("--cbf", required=True)
+    an.add_argument("--sheet", default="통합데이터")
+    an.add_argument("--prebid-dir", default=None)
+    an.add_argument("--notice", nargs="*", default=None, help="공고번호(여러 개 가능). 생략하면 물어봄")
+    an.add_argument("--list", action="store_true", help="CBF 의 개찰 전 공고 목록만 출력")
+    an.add_argument("--org", default=None, help="[직접 입력] 발주기관명(복수예가 파일명과 같게)")
+    an.add_argument("--industry", default=None, help="[직접 입력] 업종(예: 전기, 통신, 소방)")
+    an.add_argument("--base", type=float, default=None, help="[직접 입력] 기초금액(원)")
+    an.add_argument("--lower-rate", type=float, default=None, help="[직접 입력] 낙찰하한율(%%, 예: 89.745)")
+    an.add_argument("--a-value", type=float, default=None, help="[직접 입력] A값(원, 없으면 0)")
+    an.add_argument("--net-cost", type=float, default=None, help="[직접 입력] 순공사원가(원, 없으면 생략)")
+    an.add_argument("--est-price", type=float, default=None, help="[직접 입력] 추정가격(원, 100억 이상이면 순공사원가 기준 미적용)")
+    an.add_argument("--band", default=None, help="[직접 입력] 예가변동폭(3, 2, 2.5. '-3/+3' 형식은 --band=-3/+3 로)")
+    an.add_argument("--date", default=None, help="[직접 입력] 개찰일시(예: 2026-10-12 또는 '2026-10-12 11:00')")
+    an.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본) / null / 숫자")
+    an.add_argument("--n-boot", type=_nonneg_int, default=30, help="대안 낙찰확률 선택 편향 보정 부트스트랩 횟수(0: 대안 생략, 더 빠름)")
+    an.add_argument("--no-cache", action="store_true", help="저장된 표를 쓰지 않고 원본을 다시 읽음")
+    an.add_argument("--out", default="분석결과", help="결과 파일 폴더")
+    an.set_defaults(fn=cmd_analyze)
 
     ra = sub.add_parser("run-all", help="감사 + 백테스트 + 컨설팅 보고서 한 번에")
     ra.add_argument("--cbf", required=True)
@@ -344,6 +494,7 @@ def main(argv=None) -> None:
     ra.add_argument("--max-cases", type=int, default=None)
     ra.add_argument("--skip-backtest", action="store_true", help="백테스트 생략(수 분 단축)")
     ra.add_argument("--n-boot", type=_nonneg_int, default=30, help="대안(경쟁사 모형) 낙찰확률 선택 편향 보정 부트스트랩 횟수(0: 대안 생략)")
+    ra.add_argument("--no-cache", action="store_true", help="저장된 표를 쓰지 않고 원본을 다시 읽음")
     ra.add_argument("--out", default="nara_bid_stat_out")
     ra.set_defaults(fn=cmd_run_all)
 

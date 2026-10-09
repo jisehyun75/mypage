@@ -21,6 +21,7 @@ from .strategy import (
     BidderCountSampler,
     RateSourceResolver,
     _rule_for,
+    _would_win,
     alternative_candidate,
     competitors_for,
     efficient_market_probs,
@@ -30,6 +31,8 @@ from .strategy import (
 
 GUIDE = [
     ("이 보고서의 성격", "사정율은 복수예가 추첨으로 정해지는 확률변수입니다. 아래 수치는 '정답'이 아니라 과거 데이터로 보정한 확률입니다."),
+    ("BEST10", "실제 사정율이 들어갈 확률이 높은 0.1%p 구간 10개(부호 구분: -0.1x = [-0.2, -0.1), +0.0x = [0.0, 0.1)). 'BEST10 적중확률'은 그 10개 구간 확률의 합. 사정율은 추첨으로 정해지므로 어떤 방법도 이 확률보다 잘 맞힐 수 없음(±3% 기관 약 47%, 실데이터 BEST10 기준선 54%)."),
+    ("최종 추천 사정율", "투찰할 때 쓸 가정 사정율(= 기본 추천, 사정율 분포의 중앙값). '실제 사정율이 이 값이 된다'는 예측이 아니라, 낙찰확률이 가장 높은 투찰 위치. 실제 사정율이 이 값 이하이면 투찰이 유효."),
     ("사정율 분포", "같은 발주기관의 최근 복수예가 60건을 확인해, 알려진 생성 규칙(±3% 음수8/양수7, ±2% 15등분 등)이면 그 규칙의 정확한 이론분포, 국방·한전 같은 비표준 규칙이면 60건 x 1365조합 분포. 복수예가가 없으면 ±3%는 이론분포, 그 외는 CBF 동일기관 사정율(평활) 또는 예가변동폭 이론분포."),
     ("경쟁사 모형", "과거 개찰결과의 '1순위 가정 사정율 - 실제 사정율' 간격과 업체수로 추정한 경쟁사 분포. 개찰일 이전 데이터만 사용."),
     ("기본 추천 = 중앙값", "실데이터(2,360건 시간순 백테스트)에서 시장은 효율적이었고(무작위 선택 실제 39.0건 vs 이론 38.1건), 효율적 시장의 최적값인 사정율 분포 중앙값이 51건(효율적 시장 기대 44.8건)으로 가장 좋았음. 그래서 중앙값을 기본 추천으로 함."),
@@ -41,6 +44,12 @@ GUIDE = [
     ("투찰금액", "max((예정가격-A값)x하한율+A값, 순공사원가x98%x(1+사정율)), 원 미만 절상. 실제 투찰 전 공고문 확인 필수."),
     ("검증 근거", "'백테스트' 시트: 과거 공고에 같은 절차를 적용해 실제 1순위 금액과 비교한 결과(월별 재학습, 미래 데이터 미사용)."),
 ]
+
+
+def _bucket_label(y: float, width: float = 0.1) -> str:
+    """RateDistribution.bucket_of 와 같은 부호구분 구간 이름(-0.1x, +0.0x ...)."""
+    m = int(np.floor(abs(y) / width + 1e-12))
+    return f"{'-' if y < 0 else '+'}{m * width:.1f}x"
 
 
 def _fmt_interval(t: tuple[float, float]) -> str:
@@ -72,7 +81,7 @@ def consult(
     resolver = RateSourceResolver(prebid, df)
     sampler = BidderCountSampler(df)
     gaps = df[gap_sample_mask(df)]
-    summary, cands, curves = [], [], []
+    summary, cands, curves, best_rows = [], [], [], []
     model_cache: dict = {}
     boot_cache: dict = {}
     for _, r in targets.iterrows():
@@ -89,12 +98,24 @@ def consult(
         band = float(r["band"]) if band_known else 3.0
         dist, src = resolver.distribution(r["org"], band if band_known else np.nan, day)
         s = dist.summary()
+        top = dist.bucket_table(0.1)[:10]
+        cum = 0.0
+        for i, b in enumerate(top, 1):
+            cum += b["prob"]
+            best_rows.append({"공고번호": r["notice"], "순위": i, "구간": b["bucket"], "하한": b["lo"], "상한": b["hi"],
+                              "확률": b["prob"], "누적확률": cum})
         row = {
             **base_row,
             "예가변동폭": f"±{band:g}" if band_known else "미상(±3 가정)", "사정율분포_출처": src,
             "사정율_평균": s["mean"], "P(양수)": s["prob_positive"],
             "50%구간": _fmt_interval(s["interval50"]), "80%구간": _fmt_interval(s["interval80"]),
+            "BEST1_구간": top[0]["bucket"] if top else "", "BEST10_적중확률": cum,
         }
+        if r.get("status") == "COMPLETED" and np.isfinite(r.get("rate", np.nan)):
+            # 이미 개찰된 공고: 개찰일 이전 자료만으로 낸 분석을 실제 결과와 비교(참고)
+            y = float(r["rate"])
+            row.update({"실제_사정율": y, "실제_1순위사정율": r.get("winner_rate", np.nan), "실제_업체수": r.get("n_bidders", np.nan),
+                        "BEST10_적중": _bucket_label(y) in {b["bucket"] for b in top}})
         lls = r.get("lower_limit_status")
         lls = "FIXED_LOWER_LIMIT" if lls is None or (isinstance(lls, float) and np.isnan(lls)) or str(lls) in ("", "nan", "None") else str(lls)
         fixed = lls == "FIXED_LOWER_LIMIT" and np.isfinite(r["lower_rate"])
@@ -158,6 +179,10 @@ def consult(
             else:
                 notes.append(f"경쟁사 모형 대안은 선택 편향 보정 후 중앙값 대비 {ratio:.3f}배로 이점 없음")
         row["단독유효확률(참고)"] = float(c["sole_prob"].iloc[0]) if "sole_prob" in c else np.nan
+        if "실제_사정율" in row and np.isfinite(r.get("winner_rate", np.nan)) and base_ok and rule is not None:
+            row["실제결과_기본추천낙찰"] = _would_win(r, med)
+            if "대안_사정율" in row:
+                row["실제결과_대안낙찰"] = _would_win(r, float(row["대안_사정율"]))
         if not m.converged:
             notes.append("경쟁사 모형 적합이 수렴하지 않음 - 결과 주의")
         row["비고"] = "; ".join(notes)
@@ -169,6 +194,7 @@ def consult(
         curves.append(cv)
     tables: dict[str, pd.DataFrame] = {
         "요약": pd.DataFrame(summary),
+        "BEST10": pd.DataFrame(best_rows),
         "추천후보": pd.concat(cands, ignore_index=True) if cands else pd.DataFrame(),
         "낙찰확률곡선": pd.concat(curves, ignore_index=True) if curves else pd.DataFrame(),
     }
@@ -206,6 +232,7 @@ def write_consult(tables: dict[str, pd.DataFrame], out_dir: str | Path, name: st
 
 def _markdown(tables: dict[str, pd.DataFrame]) -> str:
     s = tables.get("요약", pd.DataFrame())
+    best10 = tables.get("BEST10", pd.DataFrame())
     lines = ["# 개찰 전 공고 컨설팅 보고서", ""]
     lines += [f"- {k}: {v}" for k, v in tables["안내"].itertuples(index=False)] + [""]
 
@@ -221,14 +248,23 @@ def _markdown(tables: dict[str, pd.DataFrame]) -> str:
         lines.append(f"- 개찰 {r['개찰일시']}, 기초금액 {won(base)}, 하한율 {r['낙찰하한율']}%, 예가변동폭 {r.get('예가변동폭', '-')}")
         if pd.notna(r.get("사정율_평균", np.nan)):
             lines.append(f"- 사정율 분포: {r['사정율분포_출처']} / 평균 {r['사정율_평균']:+.3f} / P(양수) {r['P(양수)']:.3f} / 50% {r['50%구간']} / 80% {r['80%구간']}")
+        bt10 = best10[best10["공고번호"] == r["공고번호"]] if len(best10) else best10
+        if len(bt10):
+            lines.append("- BEST10(0.1 구간, 확률): " + ", ".join(f"{int(b['순위'])}) {b['구간']} {b['확률']:.1%}" for _, b in bt10.iterrows())
+                         + f" / 합계 {r['BEST10_적중확률']:.1%}")
         if isinstance(r.get("비고"), str) and r.get("비고"):
             lines.append(f"- 비고: {r['비고']}")
+        if pd.notna(r.get("실제_사정율", np.nan)):
+            res = f"- 실제 결과(참고, 개찰 전 자료로만 분석): 사정율 {r['실제_사정율']:+.4f}, 1순위 {r['실제_1순위사정율']:+.4f}, 업체 {r['실제_업체수']:.0f}곳, BEST10 {'적중' if r['BEST10_적중'] else '미적중'}"
+            if pd.notna(r.get("실제결과_기본추천낙찰", np.nan)):
+                res += f", 기본 추천으로 투찰했다면 {'낙찰' if r['실제결과_기본추천낙찰'] else '미낙찰'}"
+            lines.append(res)
         if pd.notna(r.get("기본추천_사정율", np.nan)):
             lines.append(f"- 예상 업체수 {r['예상업체수(중앙값)']:.0f} ({r['업체수_출처']}), 경쟁사 모형 {r['경쟁사모형']}")
             lines.append("")
             lines.append("| 구분 | 사정율 | 투찰금액 | 낙찰확률(효율적 시장) | 낙찰확률(경쟁사 모형) | 비고 |")
             lines.append("|---|---|---|---|---|---|")
-            lines.append(f"| **기본 추천(중앙값)** | {r['기본추천_사정율']:+.3f} | {won(r['기본추천_투찰금액'])} | "
+            lines.append(f"| **최종 추천 사정율(중앙값)** | {r['기본추천_사정율']:+.3f} | {won(r['기본추천_투찰금액'])} | "
                          f"{pct(r['기본추천_낙찰확률'])} | {pct(r.get('경쟁사모형_중앙값_낙찰확률'))} | 효율적 시장 최적값 |")
             if pd.notna(r.get("대안_사정율", np.nan)):
                 lines.append(f"| 대안(경쟁사 모형) | {r['대안_사정율']:+.3f} | {won(r['대안_투찰금액'])} | "
@@ -241,3 +277,55 @@ def _markdown(tables: dict[str, pd.DataFrame]) -> str:
     if bt is not None and len(bt):
         lines += ["## 백테스트 근거", "", bt.T.to_string(), ""]
     return "\n".join(lines)
+
+
+def notice_cards(tables: dict[str, pd.DataFrame]) -> list[str]:
+    """공고별 화면 출력용 요약(BEST10, 최종 추천 사정율·투찰금액·낙찰확률, 대안, 실제 결과)."""
+    s = tables.get("요약", pd.DataFrame())
+    best10 = tables.get("BEST10", pd.DataFrame())
+    out = []
+
+    def won(v):
+        return f"{v:,.0f}원" if v is not None and pd.notna(v) else "-"
+
+    def pct(v, d=4):
+        return f"{v:.{d}%}" if v is not None and pd.notna(v) else "-"
+
+    for _, r in s.iterrows():
+        L = ["=" * 72, f"공고 {r['공고번호']} · {r['발주기관']} · {r['업종']}"]
+        L.append(f"개찰 {r['개찰일시']} · 기초금액 {won(r.get('기초금액'))} · 하한율 {r.get('낙찰하한율')}% · "
+                 f"A값 {won(r.get('A값'))} · 순공사원가 {won(r.get('순공사원가'))} · 예가변동폭 {r.get('예가변동폭', '-')}")
+        if pd.notna(r.get("사정율_평균", np.nan)):
+            L.append(f"사정율 분포: {r['사정율분포_출처']}")
+            L.append(f"  평균 {r['사정율_평균']:+.3f} · P(양수) {r['P(양수)']:.1%} · 50% 구간 {r['50%구간']} · 80% 구간 {r['80%구간']}")
+        bt = best10[best10["공고번호"] == r["공고번호"]] if len(best10) else best10
+        if len(bt):
+            L.append("")
+            L.append("BEST10 (실제 사정율이 들어갈 확률이 높은 0.1 구간)")
+            L.append("  순위  구간     범위               확률    누적")
+            for _, b in bt.iterrows():
+                L.append(f"  {int(b['순위']):>3d}  {b['구간']:<7s}  [{b['하한']:+.1f}, {b['상한']:+.1f})   {b['확률']:6.2%}  {b['누적확률']:6.2%}")
+            L.append(f"  -> BEST10 적중확률 {r['BEST10_적중확률']:.1%} (사정율은 추첨이라 어떤 방법도 이보다 잘 맞힐 수 없음)")
+        if pd.notna(r.get("기본추천_사정율", np.nan)):
+            L.append("")
+            L.append(f"최종 추천 사정율(투찰용): {r['기본추천_사정율']:+.4f}   투찰금액 {won(r.get('기본추천_투찰금액'))}")
+            mc = r.get("경쟁사모형_중앙값_낙찰확률", np.nan)
+            L.append(f"  낙찰확률 {pct(r['기본추천_낙찰확률'])} (효율적 시장 기준{', 경쟁사 모형 기준 ' + pct(mc) if pd.notna(mc) else ''}) · "
+                     f"무작위 선택 {pct(r['무작위_낙찰확률'])} · 예상 업체수 {r['예상업체수(중앙값)']:.0f}곳")
+            L.append("  근거: 사정율 분포의 중앙값 = 낙찰확률이 가장 높은 투찰 위치(실제 사정율이 이 값 이하이면 유효)")
+            if pd.notna(r.get("대안_사정율", np.nan)):
+                L.append(f"대안(경쟁사 모형, 미검증): {r['대안_사정율']:+.4f}   투찰금액 {won(r.get('대안_투찰금액'))}")
+                L.append(f"  경쟁사 모형 기준 낙찰확률 {pct(r['대안_낙찰확률(보정)'])} = 중앙값의 {r['대안_중앙값대비(보정)']:.2f}배"
+                         f"(선택 편향 보정) / 효율적 시장이면 {pct(r['대안_낙찰확률(효율적시장)'])}"
+                         f"(중앙값 {pct(r['기본추천_낙찰확률'])})로 불리")
+        if isinstance(r.get("비고"), str) and r.get("비고"):
+            L.append(f"비고: {r['비고']}")
+        if pd.notna(r.get("실제_사정율", np.nan)):
+            L.append("")
+            res = (f"[이미 개찰된 공고 - 개찰일 이전 자료로만 분석한 결과와 비교] 실제 사정율 {r['실제_사정율']:+.4f} · "
+                   f"1순위 {r['실제_1순위사정율']:+.4f} · 업체 {r['실제_업체수']:.0f}곳 · BEST10 {'적중' if r['BEST10_적중'] else '미적중'}")
+            if pd.notna(r.get("실제결과_기본추천낙찰", np.nan)):
+                res += f" · 최종 추천으로 투찰했다면 {'낙찰' if r['실제결과_기본추천낙찰'] else '미낙찰'}"
+            L.append(res)
+        out.append("\n".join(L))
+    return out

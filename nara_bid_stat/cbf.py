@@ -166,6 +166,32 @@ def standardize_cbf(raw: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["open_dt", "notice"], kind="mergesort").reset_index(drop=True)
 
 
+def manual_notice_row(columns: Iterable[str], *, notice: str, org: str, base: float, lower_rate: float, band: float,
+                      open_dt, a_value: float | None = None, net_cost: float | None = None, industry: str = "",
+                      est_price: float | None = None) -> pd.DataFrame:
+    """CBF 에 아직 없는 개찰 전 공고 한 건을 표준 컬럼 행으로 만든다(직접 입력용).
+
+    open_dt 는 '2026-10-10' 또는 '2026-10-10 11:00'. 나머지 컬럼(결과)은 비워 둔다.
+    """
+    odt = pd.to_datetime(open_dt, errors="coerce")
+    if pd.isna(odt):
+        raise ValueError(f"개찰일을 읽을 수 없습니다: {open_dt!r} (예: 2026-10-10 또는 '2026-10-10 11:00')")
+    for name, v in (("기초금액", base), ("하한율", lower_rate), ("예가변동폭", band)):
+        if v is None or not np.isfinite(float(v)) or float(v) <= 0:
+            raise ValueError(f"{name}은(는) 0보다 큰 숫자여야 합니다: {v!r}")
+    rec = {
+        "notice": str(notice).strip(), "org": str(org).strip(), "org_key": org_key(org),
+        "industry": str(industry or ""), "industry_group": industry_group(industry),
+        "base": float(base), "lower_rate": float(lower_rate), "band": float(band), "band_text": f"-{float(band):g}/+{float(band):g}",
+        "a_value": float(a_value) if a_value is not None else 0.0,
+        "net_cost": float(net_cost) if net_cost is not None and float(net_cost) > 0 else np.nan,
+        "est_price": float(est_price) if est_price is not None else np.nan,
+        "open_dt": odt, "date": odt.normalize(), "record_status": "PENDING", "status": "PENDING",
+        "lower_limit_status": "FIXED_LOWER_LIMIT", "winner_ge_floor": False,  # 개찰 전(standardize_cbf 와 같은 값)
+    }
+    return pd.DataFrame([rec]).reindex(columns=list(dict.fromkeys(list(columns) + list(rec))))
+
+
 def load_cbf(path: str | Path, sheet: str = "통합데이터") -> pd.DataFrame:
     """CBF 파일(xlsx/csv/parquet) -> 표준 컬럼 표."""
     p = Path(path)

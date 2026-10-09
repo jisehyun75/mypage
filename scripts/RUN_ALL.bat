@@ -14,7 +14,7 @@ if "%OUT%"=="" set "OUT=%ROOT%\results"
 set "PY=py -3.11"
 %PY% -c "import sys" >nul 2>&1 || set "PY=python"
 pushd "%ROOT%"
-%PY% -m pip install -q -r requirements.txt
+%PY% -c "import numpy, pandas, openpyxl" >nul 2>&1 || %PY% -m pip install -r requirements.txt
 if exist "%PREBID%" (
   %PY% -m nara_bid_stat run-all --cbf "%CBF%" --prebid-dir "%PREBID%" --out "%OUT%"
 ) else (
