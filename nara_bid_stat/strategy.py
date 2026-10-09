@@ -184,7 +184,7 @@ class BidderCountSampler:
         for label, m in levels:
             v = past.loc[m, "n_bidders"].to_numpy(float)
             if len(v) >= self.min_n:
-                local, llabel = v[-self.k:], f"{label} {min(len(v), self.k)}건"
+                local, llabel, lname = v[-self.k:], f"{label} {min(len(v), self.k)}건", label
                 break
         if local is None:
             v = past["n_bidders"].to_numpy(float)
@@ -197,7 +197,8 @@ class BidderCountSampler:
                 pool = pool[-self.pool_k:]
                 # 표본 비중 = 지역 (1 - pool_weight) : 넓은 수준 pool_weight 가 되도록 지역 표본을 반복
                 rep = max(1, int(round(len(pool) * (1.0 - self.pool_weight) / (self.pool_weight * len(local)))))
-                return np.r_[np.repeat(local, rep), pool], f"{llabel} + {label} {len(pool)}건(비중 {self.pool_weight:.0%})"
+                wide = "같은 수준" if label == lname else label
+                return np.r_[np.repeat(local, rep), pool], f"{llabel} + {wide} 최근 {len(pool)}건(비중 {self.pool_weight:.0%})"
         return local, llabel
 
 
@@ -234,11 +235,15 @@ def competitors_for(model, dist: RateDistribution, band: float):
     return model
 
 
-def efficient_market_probs(n_samples) -> dict:
-    """효율적 시장(경쟁사 = 사정율 분포)에서 업체수 표본 평균: 중앙값 (1-2^-N)/N, 무작위 선택 1/(N+2)."""
+def efficient_market_probs(n_samples, f_x: float | None = None) -> dict:
+    """효율적 시장(경쟁사 = 사정율 분포)에서 업체수 표본 평균: 중앙값 (1-2^-N)/N, 무작위 선택 1/(N+2),
+    f_x(=F(x))를 주면 그 x 의 값("at")도."""
     ns = np.asarray(n_samples, dtype=float)
     ns = ns[np.isfinite(ns) & (ns >= 0)]
-    return {"median": float(np.mean(null_win_prob(0.5, ns))), "random": float(np.mean(1.0 / (ns + 2.0)))}
+    out = {"median": float(np.mean(null_win_prob(0.5, ns))), "random": float(np.mean(1.0 / (ns + 2.0)))}
+    if f_x is not None:
+        out["at"] = float(np.mean(null_win_prob(f_x, ns)))
+    return out
 
 
 def alternative_candidate(candidates: pd.DataFrame, median_rate: float, min_distance: float = 0.05):
