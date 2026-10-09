@@ -113,5 +113,71 @@ class AnalyzeTests(unittest.TestCase):
                 _run(["analyze", "--cbf", str(csv), "--notice", "NEW-3", "--org", "x", "--no-cache", "--out", str(out)])
 
 
+
+class AnalyzeRobustnessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        raw = make_raw_cbf(700, seed=32, n_pending=2)
+        pend = raw[raw["record_status"].eq("PENDING")].iloc[0]
+        old = raw[raw["record_status"].eq("COMPLETED")].iloc[5].copy()
+        old["공고번호"] = pend["공고번호"]  # 국방처럼 번호 재사용
+        cls.raw = pd.concat([raw, old.to_frame().T], ignore_index=True)
+        cls.pending = pend["공고번호"]
+
+    def _csv(self, tmp):
+        csv = Path(tmp) / "cbf.csv"
+        self.raw.to_csv(csv, index=False, encoding="utf-8-sig")
+        return csv
+
+    def test_duplicate_number_analyses_one_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv, out = self._csv(tmp), Path(tmp) / "out"
+            text = _run(["analyze", "--cbf", str(csv), "--notice", self.pending, "--n-boot", "0", "--no-cache", "--out", str(out)])
+            self.assertIn("2건 있습니다", text)
+            self.assertEqual(text.count("최종 추천 사정율(투찰용)"), 1)
+            b = pd.read_excel(out / f"분석_{self.pending}.xlsx", sheet_name="BEST10")
+            self.assertEqual(len(b), 10)
+            text = _run(["analyze", "--cbf", str(csv), "--notice", self.pending, "--band=-2/+2", "--base", "1e8",
+                         "--n-boot", "0", "--no-cache", "--out", str(out)])
+            self.assertIn("±2", text)
+            self.assertIn("100,000,000원", text)
+
+    def test_input_validation_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv = self._csv(tmp)
+            base = ["analyze", "--cbf", str(csv), "--notice", "N1", "--org", "x", "--base", "1e8", "--band", "3",
+                    "--date", "2026-07-01", "--no-cache", "--out", str(Path(tmp) / "o")]
+            for extra, msg in ((["--lower-rate", "0.89745"], "% 숫자"), (["--lower-rate", "120"], "범위"),
+                               (["--lower-rate", "89.745", "--a-value", "2e8"], "기초금액보다"),
+                               (["--lower-rate", "89.745", "--band", "abc"], "예가변동폭")):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    _run(base + extra)
+                self.assertIn(msg, str(cm.exception.code))
+
+    def test_prebid_folder_detection_and_env_paths(self):
+        from nara_bid_stat.__main__ import _load_prebid_opt, _resolve_cbf, _resolve_prebid
+
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertIsNone(_load_prebid_opt(str(empty), cache=False))
+            self.assertIn("xlsx 파일이 없습니다", buf.getvalue())
+            cbf = Path(tmp) / "CBF.xlsx.xlsx"
+            cbf.write_bytes(b"x")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(_resolve_cbf(str(Path(tmp) / "CBF.xlsx")), str(cbf))
+            os.environ["NARA_CBF"] = f'"{cbf}"'
+            try:
+                self.assertEqual(_resolve_cbf(None), str(cbf))
+            finally:
+                del os.environ["NARA_CBF"]
+            (Path(tmp) / "복수예가").mkdir()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(Path(_resolve_prebid(None, str(cbf))).name, "복수예가")
+
+
 if __name__ == "__main__":
     unittest.main()

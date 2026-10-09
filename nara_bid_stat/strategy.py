@@ -96,6 +96,8 @@ class RateSourceResolver:
                     keep = np.abs(np.abs(hist).max(axis=1) - band) <= 0.26
                     if keep.sum() >= self.min_history:
                         hist = hist[keep]
+                    else:  # 국방처럼 15개 범위가 표시 변동폭과 다른 기관, 또는 변동폭이 바뀐 공고
+                        label += f"[±{band:g} 이력 {int(keep.sum())}건뿐이라 전체 이력 사용]"
                 recent_hist = hist[-self.recent:]
                 if self.use_known_scheme:
                     # 최근 이력이 알려진 생성 규칙 하나로 확인되면 그 규칙의 정확한 이론분포를 쓴다.

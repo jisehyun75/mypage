@@ -1,6 +1,6 @@
 """읽어 들인 CBF·복수예가 표를 사용자 폴더에 캐시한다(같은 파일이면 두 번째부터 몇 초).
 
-캐시 이름에는 원본 경로, 파일 크기·수정시각, 로더 코드(cbf.py, data.py)와 pandas 버전이 들어간다.
+캐시 이름에는 원본 경로, 파일 크기·수정시각, 이 패키지의 코드 전체와 pandas 버전이 들어간다.
 원본 파일을 고치거나 로더가 바뀌면 자동으로 다시 읽는다. 캐시를 읽지 못하면 조용히 다시 만든다.
 캐시는 이 프로그램이 직접 만든 파일만 읽는다(기본 위치: 사용자 폴더의 .nara_bid_stat_cache).
 """
@@ -13,20 +13,16 @@ from typing import Callable, Iterable
 
 import pandas as pd
 
-_LOADER_FILES = ("cbf.py", "data.py", "mechanism.py", "cache.py")
-
-
 def default_cache_dir() -> Path:
     return Path(os.environ.get("NARA_CACHE_DIR") or (Path.home() / ".nara_bid_stat_cache"))
 
 
 def _code_hash() -> str:
+    """패키지의 모든 .py 와 pandas 버전(코드가 바뀌면 캐시를 다시 만든다)."""
     h = hashlib.sha1(pd.__version__.encode())
-    here = Path(__file__).resolve().parent
-    for name in _LOADER_FILES:
-        p = here / name
-        if p.exists():
-            h.update(p.read_bytes())
+    for p in sorted(Path(__file__).resolve().parent.glob("*.py")):
+        h.update(p.name.encode())
+        h.update(p.read_bytes())
     return h.hexdigest()
 
 

@@ -177,6 +177,15 @@ def _load_prebid_opt(path, cache: bool = True):
     if not folder.is_dir():
         sys.exit(f"복수예가 폴더를 찾을 수 없습니다: {path}")
     files = sorted(p for p in folder.glob("*.xlsx") if not p.name.startswith("~$"))
+    if not files:  # 폴더째 한 단계 안에 넣은 경우(data\prebid\복수예가\*.xlsx)
+        subs = sorted({p.parent for p in folder.glob("*/*.xlsx") if not p.name.startswith("~$")})
+        if len(subs) == 1:
+            print(f"[load] 복수예가 파일을 하위 폴더에서 찾았습니다: {subs[0]}")
+            folder, path = subs[0], str(subs[0])
+            files = sorted(p for p in folder.glob("*.xlsx") if not p.name.startswith("~$"))
+    if not files:
+        print(f"[주의] 복수예가 폴더에 xlsx 파일이 없습니다: {folder} (파일을 폴더 바로 안에 두십시오) - 복수예가 없이 분석합니다.")
+        return None
     build = lambda: load_prebid_folder(path)  # noqa: E731
     pb = cached_frame("prebid", str(folder.resolve()), files, build,
                       log=lambda m: print(m, flush=True)) if cache and files else build()
@@ -268,14 +277,120 @@ def _safe_name(text: str) -> str:
     return re.sub(r'[\\/:*?"<>|\s]+', "_", text).strip("_")[:80] or "분석"
 
 
+def _clean_path(v) -> str | None:
+    """경로 문자열의 앞뒤 공백·따옴표·끝의 역슬래시 제거(환경변수·복사한 경로 대비)."""
+    if v is None:
+        return None
+    v = str(v).strip().strip('"').strip("'").strip()
+    while len(v) > 3 and v.endswith(("\\", "/")):
+        v = v[:-1]
+    return v or None
+
+
+def _resolve_cbf(path) -> str:
+    import os
+    from pathlib import Path
+
+    path = _clean_path(path) or _clean_path(os.environ.get("NARA_CBF"))
+    if not path:
+        sys.exit("CBF 파일 경로가 필요합니다(--cbf 또는 환경변수 NARA_CBF).")
+    p = Path(path)
+    if not p.exists() and Path(path + ".xlsx").exists():  # Windows 가 확장명을 숨겨 'CBF.xlsx.xlsx' 로 저장된 경우
+        print(f"[주의] {p.name} 대신 {p.name}.xlsx 를 사용합니다(파일 확장명 숨김 설정 때문일 수 있음).")
+        return path + ".xlsx"
+    return path
+
+
+def _resolve_prebid(path, cbf_path: str):
+    """--prebid-dir -> 환경변수 NARA_PREBID -> CBF 옆의 prebid / 복수예가 폴더 순으로 찾는다."""
+    import os
+    from pathlib import Path
+
+    path = _clean_path(path) or _clean_path(os.environ.get("NARA_PREBID"))
+    if path:
+        return path
+    for name in ("prebid", "복수예가"):
+        cand = Path(cbf_path).resolve().parent / name
+        if cand.is_dir():
+            print(f"[load] 복수예가 폴더 자동 사용: {cand}")
+            return str(cand)
+    print("[주의] 복수예가 폴더 없이 분석합니다(--prebid-dir 지정 또는 CBF 옆 prebid 폴더에 넣기). "
+          "이 경우 사정율 분포는 예가변동폭 이론분포·CBF 이력으로만 만들어집니다.")
+    return None
+
+
+def _check_inputs(manual: dict) -> dict:
+    """직접 입력·덮어쓰기 값 검사. 잘못되면 한국어 메시지로 종료."""
+    from .cbf import parse_band
+
+    out = dict(manual)
+    for k in ("base", "a_value", "net_cost", "est_price", "lower_rate"):
+        if k in out:
+            try:
+                out[k] = float(out[k])
+            except (TypeError, ValueError):
+                sys.exit(f"--{k.replace('_', '-')} 값을 숫자로 읽을 수 없습니다: {out[k]!r}")
+    if "base" in out and not out["base"] > 0:
+        sys.exit(f"기초금액은 0보다 커야 합니다: {out['base']}")
+    if "lower_rate" in out:
+        lr = out["lower_rate"]
+        if 0 < lr < 1:
+            sys.exit(f"하한율은 89.745 처럼 % 숫자로 입력하십시오: {lr}")
+        if not 70 <= lr < 100:
+            sys.exit(f"하한율이 범위(70 ~ 100%)를 벗어났습니다: {lr}")
+    for k in ("a_value", "net_cost", "est_price"):
+        if k in out and out[k] < 0:
+            sys.exit(f"--{k.replace('_', '-')} 은(는) 0 이상이어야 합니다: {out[k]}")
+        if k in ("a_value", "net_cost") and k in out and "base" in out and out[k] >= out["base"]:
+            sys.exit(f"--{k.replace('_', '-')} 이(가) 기초금액보다 큽니다: {out[k]:,.0f} >= {out['base']:,.0f}")
+    if "band" in out:
+        b = parse_band(out["band"])
+        if not (np.isfinite(b) and 0 < b <= 5):
+            sys.exit(f"예가변동폭을 읽을 수 없습니다: {out['band']!r} (예: 3, 2, 2.5 또는 --band=-3/+3)")
+        out["band"] = b
+    if "date" in out:
+        odt = pd.to_datetime(out["date"], errors="coerce")
+        if pd.isna(odt):
+            sys.exit(f"개찰일을 읽을 수 없습니다: {out['date']!r} (예: 2026-10-12 또는 \"2026-10-12 11:00\")")
+        out["date"] = odt
+    return out
+
+
+def _pick_row(df: pd.DataFrame, nid: str) -> int:
+    """같은 공고번호가 여러 건이면(국방 번호는 해마다 재사용) 개찰 전 건, 없으면 가장 최근 건을 고른다."""
+    rows = df[df["notice"].astype(str).eq(nid)]
+    if len(rows) == 1:
+        return int(rows.index[0])
+    pend = rows[rows["status"].eq("PENDING")]
+    pick = (pend if len(pend) else rows).sort_values("open_dt", kind="mergesort").index[-1]
+    print(f"[주의] 공고번호 {nid} 가 CBF 에 {len(rows)}건 있습니다(번호 재사용):")
+    for i, r in rows.sort_values("open_dt", kind="mergesort").iterrows():
+        print(f"   {'->' if i == pick else '  '} 개찰 {r['open_dt']} · {r['org']} · {r['industry']} · {r['status']}")
+    print("   표시(->)한 건을 분석합니다(개찰 전 건 우선, 없으면 가장 최근).")
+    return int(pick)
+
+
+def _warn_unknown_org(org: str, source: str, pb) -> None:
+    """직접 입력한 기관의 사정율 분포가 복수예가에서 나오지 않았으면 비슷한 복수예가 기관명을 알려 준다."""
+    import difflib
+
+    if pb is None or str(source).startswith("복수예가"):
+        return
+    names = sorted(set(pb["org"].astype(str)))
+    near = [n for n in difflib.get_close_matches(str(org), names, n=5, cutoff=0.5) if n != org]
+    print(f"[주의] 기관명 '{org}' 의 복수예가 이력을 찾지 못해 '{source}' 로 계산했습니다."
+          + (f" 복수예가 파일의 비슷한 기관명: {', '.join(near)}" if near else ""))
+
+
 def cmd_analyze(args) -> None:
     """공고번호(또는 직접 입력한 공고)를 분석해 BEST10 과 최종 추천 사정율을 출력·저장한다."""
     from pathlib import Path
 
-    from .cbf import industry_group, manual_notice_row, org_key, parse_band
+    from .cbf import industry_group, manual_notice_row, org_key
     from .consult import consult, notice_cards, write_consult
 
-    df = _load_cbf(args.cbf, args.sheet, not args.no_cache)
+    cbf_path = _resolve_cbf(args.cbf)
+    df = _load_cbf(cbf_path, args.sheet, not args.no_cache)
     if args.list:
         p = df[df["status"].eq("PENDING")].sort_values("open_dt", kind="mergesort")
         cols = ["notice", "org", "industry", "open_dt", "base", "lower_rate", "a_value", "band"]
@@ -290,34 +405,55 @@ def cmd_analyze(args) -> None:
     notices = [n.strip() for n in (args.notice or []) if n.strip()]
     if not notices and not manual:
         if sys.stdin is not None and sys.stdin.isatty():
-            notices = input("공고번호를 입력하세요(여러 개는 띄어쓰기로 구분): ").split()
+            try:
+                notices = input("공고번호를 입력하세요(여러 개는 띄어쓰기로 구분): ").split()
+            except (EOFError, KeyboardInterrupt):
+                notices = []
         if not notices:
             sys.exit("공고번호(--notice) 또는 직접 입력 항목(--org --base --lower-rate --band --date)이 필요합니다. "
                      "개찰 전 공고 목록은 --list 로 볼 수 있습니다.")
+    manual = _check_inputs(manual)
     known = set(df["notice"].astype(str))
+    rows: list[int] = []
+    new_org = None
     if manual:
         if len(notices) > 1:
             sys.exit("직접 입력 항목(--org, --base 등)은 공고 하나에만 쓸 수 있습니다.")
         nid = notices[0] if notices else "직접입력"
         notices = [nid]
         if nid in known:  # CBF 에 있는 공고의 일부 값을 바꿔서 분석(예: 기초금액 공개 후)
-            m = df["notice"].astype(str).eq(nid)
+            i = _pick_row(df, nid)
             df = df.copy()
+            if "a_value" in manual or "net_cost" in manual:
+                base = manual.get("base", df.at[i, "base"])
+                for k in ("a_value", "net_cost"):
+                    if k in manual and pd.notna(base) and manual[k] >= base:
+                        sys.exit(f"--{k.replace('_', '-')} 이(가) 기초금액보다 큽니다: {manual[k]:,.0f} >= {base:,.0f}")
             for k, v in manual.items():
                 if k == "date":
-                    odt = pd.to_datetime(v, errors="coerce")
-                    if pd.isna(odt):
-                        sys.exit(f"개찰일을 읽을 수 없습니다: {v}")
-                    df.loc[m, "open_dt"] = odt
-                    df.loc[m, "date"] = odt.normalize()
+                    df.at[i, "open_dt"] = v
+                    df.at[i, "date"] = v.normalize()
                 elif k == "org":
-                    df.loc[m, "org"] = v
-                    df.loc[m, "org_key"] = org_key(v)
+                    df.at[i, "org"] = v
+                    df.at[i, "org_key"] = org_key(v)
+                    new_org = v
                 elif k == "industry":
-                    df.loc[m, "industry"] = v
-                    df.loc[m, "industry_group"] = industry_group(v)
+                    df.at[i, "industry"] = v
+                    df.at[i, "industry_group"] = industry_group(v)
+                elif k == "band":
+                    df.at[i, "band"] = v
+                    df.at[i, "band_text"] = f"-{v:g}/+{v:g}"
+                elif k == "net_cost":
+                    df.at[i, "net_cost"] = v if v > 0 else np.nan
                 else:
-                    df.loc[m, k] = float(v)
+                    df.at[i, k] = v
+            if "lower_rate" in manual:
+                lls = str(df.at[i, "lower_limit_status"]) if pd.notna(df.at[i, "lower_limit_status"]) else ""
+                if lls == "NO_FIXED_LOWER_LIMIT":
+                    print("[주의] CBF 에서 이 공고는 고정 하한율이 아닌 공고(종합심사 등)로 되어 있어 투찰금액은 계산하지 않습니다.")
+                elif lls != "FIXED_LOWER_LIMIT":
+                    df.at[i, "lower_limit_status"] = "FIXED_LOWER_LIMIT"
+            rows = [i]
             print(f"[입력] {nid}: CBF 값 중 {', '.join(manual)} 을(를) 입력값으로 바꿔 분석합니다.")
         else:
             need = [k for k in ("org", "base", "lower_rate", "band", "date") if k not in manual]
@@ -326,13 +462,15 @@ def cmd_analyze(args) -> None:
                 sys.exit(f"CBF 에 없는 공고 '{nid}' 를 직접 입력하려면 {flags} 도 필요합니다.")
             try:
                 row = manual_notice_row(df.columns, notice=nid, org=manual["org"], base=manual["base"],
-                                        lower_rate=manual["lower_rate"], band=parse_band(manual["band"]),
+                                        lower_rate=manual["lower_rate"], band=manual["band"],
                                         open_dt=manual["date"], a_value=manual.get("a_value"),
                                         net_cost=manual.get("net_cost"), industry=manual.get("industry", ""),
                                         est_price=manual.get("est_price"))
             except ValueError as e:
                 sys.exit(str(e))
             df = pd.concat([df, row], ignore_index=True)
+            rows = [int(df.index[-1])]
+            new_org = manual["org"]
             print(f"[입력] {nid}: CBF 에 없는 공고를 직접 입력값으로 분석합니다.")
     else:
         missing = [n for n in notices if n not in known]
@@ -347,9 +485,12 @@ def cmd_analyze(args) -> None:
             if not notices:
                 sys.exit("CBF 에 없는 공고는 --org --base --lower-rate --band --date (필요하면 --a-value --net-cost --industry)로 "
                          "직접 입력해 분석할 수 있습니다.")
-    pb = _load_prebid_opt(args.prebid_dir, not args.no_cache)
+        rows = [_pick_row(df, n) for n in dict.fromkeys(notices)]
+    pb = _load_prebid_opt(_resolve_prebid(args.prebid_dir, cbf_path), not args.no_cache)
     print(f"[분석] {', '.join(notices)} (대안 보정 부트스트랩 {args.n_boot}회) ...", flush=True)
-    tables = consult(df, pb, notices=notices, lam=args.lam, n_boot=args.n_boot)
+    tables = consult(df, pb, rows=rows, lam=args.lam, n_boot=args.n_boot)
+    if new_org is not None and "사정율분포_출처" in tables["요약"]:
+        _warn_unknown_org(new_org, tables["요약"]["사정율분포_출처"].iloc[0], pb)
     for card in notice_cards(tables):
         print(card)
     name = "분석_" + (_safe_name("_".join(notices)) if len(notices) <= 3 else f"{_safe_name(notices[0])}_외{len(notices) - 1}건")
@@ -464,9 +605,9 @@ def main(argv=None) -> None:
     k.set_defaults(fn=cmd_consult)
 
     an = sub.add_parser("analyze", help="공고 하나(또는 몇 개) 분석: BEST10 + 최종 추천 사정율·투찰금액·낙찰확률")
-    an.add_argument("--cbf", required=True)
+    an.add_argument("--cbf", default=None, help="CBF 파일(생략 시 환경변수 NARA_CBF)")
     an.add_argument("--sheet", default="통합데이터")
-    an.add_argument("--prebid-dir", default=None)
+    an.add_argument("--prebid-dir", default=None, help="복수예가 폴더(생략 시 NARA_PREBID, 없으면 CBF 옆 prebid·복수예가 폴더)")
     an.add_argument("--notice", nargs="*", default=None, help="공고번호(여러 개 가능). 생략하면 물어봄")
     an.add_argument("--list", action="store_true", help="CBF 의 개찰 전 공고 목록만 출력")
     an.add_argument("--org", default=None, help="[직접 입력] 발주기관명(복수예가 파일명과 같게)")
