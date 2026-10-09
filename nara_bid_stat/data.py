@@ -3,7 +3,8 @@
 입력 형식(발주기관별 xlsx, 첫 행 헤더):
     개찰일 | 공고명 | 기초금액 | 예정가격 | 예가/기초 | 1번 ... 15번 | 평균
 
-* 1번~15번, 예가/기초는 기초금액 대비 편차(%) 이다.
+* 1번~15번, 예가/기초는 기초금액 대비 편차(%) 이다. 단, (기초금액-A값) 기준으로 적힌 행(LH 등)은
+  금액으로 감지해 기초금액 기준으로 환산한다(rate_scale 컬럼).
 * 파일명(확장자 제외)을 발주기관명으로 쓴다.
 * 여러 파일에 같은 공고가 들어 있으면(개찰일·공고명·기초금액·예정가격 동일) 1건만 남긴다.
 """
@@ -94,7 +95,7 @@ def read_prebid_workbook(path: str | Path, org: str | None = None) -> pd.DataFra
 def load_prebid_folder(folder: str | Path, patterns: Iterable[str] = ("*.xlsx",)) -> pd.DataFrame:
     """폴더 안 모든 복수예가 Excel 을 읽어 정제된 하나의 표로 돌려준다.
 
-    반환 컬럼: org, date, title, base, expected, rate, p1..p15(오름차순), half_range
+    반환 컬럼: org, date, title, base, expected, rate, p1..p15(오름차순), half_range, rate_scale
     """
     folder = Path(folder)
     files = sorted({p for pat in patterns for p in folder.glob(pat) if not p.name.startswith("~$")})
@@ -107,9 +108,15 @@ def load_prebid_folder(folder: str | Path, patterns: Iterable[str] = ("*.xlsx",)
 
 def clean_prebid_frame(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # 예가/기초가 비어 있으면 금액으로 계산
     calc = (df["expected"] / df["base"] - 1.0) * 100.0
-    df["rate"] = df["rate"].where(df["rate"].notna(), calc)
+    # 일부 기관(LH)은 파일의 사정율·15개 예가가 (예정가격-기초금액)/(기초금액-A값) 기준이다.
+    # 금액으로 계산한 사정율과 비율 k=(B-A)/B 로 어긋나면 그 행의 값을 기초금액 기준으로 환산한다.
+    k = calc / df["rate"]
+    alt = (df["rate"].abs() > 0.02) & ((calc - df["rate"]).abs() > 2e-4) & k.between(0.8, 0.9995)
+    df.loc[alt, P_COLS] = df.loc[alt, P_COLS].mul(k[alt], axis=0)
+    df["rate_scale"] = np.where(alt, "base_minus_a", "base")
+    # 사정율은 금액으로 정확히(파일 값은 소수 4자리), 금액이 없으면 파일 값
+    df["rate"] = calc.where(calc.notna(), df["rate"])
     ok = df[P_COLS].notna().all(axis=1) & df["rate"].notna() & df["date"].notna()
     df = df[ok].copy()
     x = np.sort(df[P_COLS].to_numpy(dtype=float), axis=1)

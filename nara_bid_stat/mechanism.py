@@ -143,6 +143,9 @@ class RateDistribution:
     weights: np.ndarray
     source: str = ""
     n_history: int = 0
+    #: 표본이 이산적일 때 쓰는 가우스 평활 대역폭(%p). 0 이면 평활하지 않음.
+    #: 낙찰확률 최적화가 과거값(점) 바로 위를 '빈 구간'으로 착각하지 않게 한다.
+    bandwidth: float = 0.0
     _cum: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -159,10 +162,23 @@ class RateDistribution:
 
     # -- 생성자 ------------------------------------------------------------
     @classmethod
-    def from_samples(cls, samples: np.ndarray, weights: np.ndarray | None = None, *, source: str = "", n_history: int = 0) -> "RateDistribution":
+    def from_samples(cls, samples: np.ndarray, weights: np.ndarray | None = None, *, source: str = "",
+                     n_history: int = 0, bandwidth: float = 0.0) -> "RateDistribution":
         s = np.asarray(samples, dtype=float).ravel()
         w = np.ones_like(s) if weights is None else np.asarray(weights, dtype=float).ravel()
-        return cls(s, w, source=source, n_history=n_history)
+        return cls(s, w, source=source, n_history=n_history, bandwidth=float(bandwidth))
+
+    @classmethod
+    def from_rate_history(cls, rates: np.ndarray, *, source: str = "rate_history") -> "RateDistribution":
+        """과거 실제 사정율 표본(이산) -> Silverman 대역폭으로 평활한 분포."""
+        y = np.asarray(rates, dtype=float).ravel()
+        y = y[np.isfinite(y)]
+        n = len(y)
+        sd = float(np.std(y, ddof=1)) if n > 1 else 0.5
+        iqr = float(np.subtract(*np.quantile(y, [0.75, 0.25]))) if n > 3 else sd * 1.34
+        spread = min(sd, iqr / 1.34) if iqr > 0 else sd
+        bw = 0.9 * max(spread, 1e-3) * max(n, 1) ** (-0.2)
+        return cls.from_samples(y, source=source, n_history=n, bandwidth=bw)
 
     @classmethod
     def from_prebid_history(cls, history: np.ndarray, recent: int | None = 60) -> "RateDistribution":
@@ -176,7 +192,8 @@ class RateDistribution:
             raise ValueError("history 는 (n, 15) 이어야 합니다")
         if recent:
             h = h[-int(recent):]
-        return cls.from_samples(combo_means(h).ravel(), source=f"mechanism_bootstrap(recent={len(h)})", n_history=len(h))
+        return cls.from_samples(combo_means(h).ravel(), source=f"mechanism_bootstrap(recent={len(h)})",
+                                n_history=len(h), bandwidth=0.02)
 
     @classmethod
     def from_prices(cls, prices: Sequence[float]) -> "RateDistribution":
@@ -187,6 +204,29 @@ class RateDistribution:
     def cdf(self, x: float | np.ndarray) -> np.ndarray:
         idx = np.searchsorted(self.values, np.asarray(x, dtype=float), side="right")
         return np.where(idx > 0, self._cum[np.maximum(idx - 1, 0)], 0.0)
+
+    def smooth_cdf(self, x: float | np.ndarray) -> np.ndarray:
+        """대역폭으로 평활한 누적분포. bandwidth=0 이면 cdf 와 같다."""
+        x = np.asarray(x, dtype=float)
+        if self.bandwidth <= 0:
+            return self.cdf(x)
+        bw = self.bandwidth
+        flat = np.atleast_1d(x).ravel()
+        out = np.empty(len(flat))
+        lo_idx = np.searchsorted(self.values, flat - 8 * bw, side="left")
+        hi_idx = np.searchsorted(self.values, flat + 8 * bw, side="right")
+        cum0 = np.r_[0.0, self._cum]
+        for i, (xi, a, b) in enumerate(zip(flat, lo_idx, hi_idx)):
+            z = (xi - self.values[a:b]) / bw
+            out[i] = cum0[a] + float((self.weights[a:b] * _norm_cdf(z)).sum())  # np.dot 은 BLAS 스레드 비용이 큼
+        return out.reshape(x.shape) if x.ndim else out[0]
+
+    def sample_points(self, n: int, seed: int = 12345) -> np.ndarray:
+        """층화 분위 표본(정렬). 평활 대역폭이 있으면 고정 시드 가우스 잡음을 더한다(재현 가능)."""
+        y = self.quantile((np.arange(n) + 0.5) / n)
+        if self.bandwidth > 0:
+            y = np.sort(y + self.bandwidth * np.random.default_rng(seed).standard_normal(n))
+        return y
 
     def quantile(self, q: float | np.ndarray) -> np.ndarray:
         q = np.clip(np.asarray(q, dtype=float), 0.0, 1.0)
@@ -257,6 +297,15 @@ class RateDistribution:
             "interval50": (lo50, hi50),
             "interval80": (lo80, hi80),
         }
+
+
+def _norm_cdf(z: np.ndarray) -> np.ndarray:
+    """표준정규 누적분포(Abramowitz-Stegun 26.2.17, 오차 < 7.5e-8). scipy 없이 벡터 계산."""
+    z = np.asarray(z, dtype=float)
+    t = 1.0 / (1.0 + 0.2316419 * np.abs(z))
+    poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    tail = np.exp(-0.5 * z * z) / np.sqrt(2 * np.pi) * poly
+    return np.where(z >= 0, 1.0 - tail, tail)
 
 
 def _dec(width: float) -> int:

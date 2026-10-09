@@ -5,6 +5,12 @@
     python -m nara_bid_stat bid      --base 123456000 --lower-rate 87.745 --a-value 0 --rate -0.12
     python -m nara_bid_stat winprob  --prebid-dir 복수예가 --org "충청북도 청주시" --competitors comp.csv --n 120
     python -m nara_bid_stat nulltest --cases 60 --prior 0.44
+
+    # CBF(입찰·낙찰 통합 DB) 연동
+    python -m nara_bid_stat cbf-audit --cbf CBF.xlsx --out cbf_audit
+    python -m nara_bid_stat backtest  --cbf CBF.xlsx --prebid-dir 복수예가 --start 2025-07-01 --out backtest_out
+    python -m nara_bid_stat consult   --cbf CBF.xlsx --prebid-dir 복수예가 --backtest backtest_out --out consult_out
+    python -m nara_bid_stat run-all   --cbf CBF.xlsx --prebid-dir 복수예가 --out 결과      # 위 셋을 한 번에
 """
 from __future__ import annotations
 
@@ -68,7 +74,7 @@ def cmd_bid(args) -> None:
     from .bid import AwardRule, bid_for_assumed_rate
 
     rule = AwardRule(args.lower_rate, args.a_value, args.net_cost, rounding=args.rounding,
-                     net_cost_scales_with_rate=args.net_cost_scaled)
+                     net_cost_scales_with_rate=not args.net_cost_unscaled)
     print(json.dumps(bid_for_assumed_rate(args.base, args.rate, rule), ensure_ascii=False, indent=2))
 
 
@@ -83,8 +89,10 @@ def cmd_winprob(args) -> None:
     col = "rate" if "rate" in comp.columns else comp.columns[0]
     curve = win_probability_curve(dist, comp[col].to_numpy(dtype=float), args.n)
     print(f"경쟁사 표본 {len(comp)}개, 참여사 수 가정 {args.n}")
+    print("(정렬 기준: contested_prob = 다른 유효 투찰이 있을 때의 낙찰확률. sole_prob 는 나만 유효한 경우로 검증 불가)")
     print(best_rates(curve, k=args.top).to_string(index=False))
-    print(f"\n참고: 무작위 선택 시 기대 낙찰확률 ~ 1/(N+1) = {1 / (args.n + 1):.4f}")
+    n = args.n
+    print(f"\n참고(효율적 시장): 무작위 선택 1/(N+2) = {1 / (n + 2):.4f}, 1순위가 있는 공고에서 중앙값 (1-2^-N)/N = {(1 - 2.0 ** -n) / max(n, 1):.4f}")
     if args.out:
         curve.to_csv(args.out, index=False, encoding="utf-8-sig")
 
@@ -96,6 +104,133 @@ def cmd_nulltest(args) -> None:
                           ("strict_gate(권장)", strict_gate(args.prior), max(args.cases, 600))):
         r = null_tuning_simulation(gate, n_cases=n, prior_positive=args.prior, trials=args.trials)
         print(f"{name:32s} 사례 {n:4d}건: 무정보 모델 통과율 {r['fire_rate']:.1%}, 통과 시 보고 정확도 {r['mean_reported_accuracy_when_fired']:.3f}")
+
+
+def _lam_arg(v: str):
+    v = str(v).strip().lower()
+    if v == "auto":
+        return "auto"
+    if v in ("null", "none"):
+        return None
+    x = float(v)
+    if not np.isfinite(x) or x <= 0:
+        raise argparse.ArgumentTypeError("--lam 은 auto, null 또는 양의 유한한 숫자여야 합니다")
+    return x
+
+
+def _load_cbf(path: str, sheet: str):
+    from .cbf import load_cbf
+
+    print(f"[load] CBF {path} (시트 {sheet}) ...", flush=True)
+    df = load_cbf(path, sheet=sheet)
+    print(f"[load] {len(df):,}건, 완료 {int(df['status'].eq('COMPLETED').sum()):,} / 개찰 전 {int(df['status'].eq('PENDING').sum())}", flush=True)
+    return df
+
+
+def _load_prebid_opt(path):
+    if not path:
+        return None
+    from .data import load_prebid_folder
+
+    pb = load_prebid_folder(path)
+    print(f"[load] 복수예가 {len(pb):,}건 / 기관 {pb['org'].nunique()}곳", flush=True)
+    return pb
+
+
+def _save_tables(tables: dict, out: str) -> None:
+    from pathlib import Path
+
+    o = Path(out)
+    o.mkdir(parents=True, exist_ok=True)
+    for name, t in tables.items():
+        t.to_csv(o / f"{name}.csv", index=False, encoding="utf-8-sig")
+    print(f"[ok] {o.resolve()}")
+
+
+def cmd_cbf_audit(args, df=None) -> None:
+    from .cbf import gap_sample_mask, quality_report, verify_floor_formula, verify_net_cost_rule
+    from .competition import fit_model_set, gap_diagnostics
+
+    df = _load_cbf(args.cbf, args.sheet) if df is None else df
+    gaps = df[gap_sample_mask(df)]
+    models = fit_model_set(gaps, lam=args.lam)
+    tables = {
+        "data_quality": quality_report(df),
+        "floor_formula": verify_floor_formula(df),
+        "net_cost_rule": verify_net_cost_rule(df),
+        "competitor_models": models.summary(),
+        "competitor_diagnostics": gap_diagnostics(gaps, models),
+    }
+    for band, m in sorted(models.by_band.items()):
+        tables[f"competitor_density_{band:g}"] = m.table()
+    if models.selection is not None and len(models.selection):
+        tables["competitor_lambda_selection"] = models.selection
+    for k in ("data_quality", "floor_formula", "net_cost_rule", "competitor_models", "competitor_diagnostics"):
+        print(f"\n== {k}")
+        print(tables[k].to_string(index=False))
+    _save_tables(tables, args.out)
+
+
+def cmd_backtest(args, df=None, pb=None):
+    from .strategy import strategy_backtest, summarize_backtest
+
+    df = _load_cbf(args.cbf, args.sheet) if df is None else df
+    pb = _load_prebid_opt(args.prebid_dir) if pb is None else pb
+    cases = strategy_backtest(df, pb, start=args.start, end=args.end, lam=args.lam, max_cases=args.max_cases,
+                              progress=lambda m: print("  " + m, flush=True))
+    summ = summarize_backtest(cases)
+    tables = {"cases": cases, "summary": summ}
+    if len(cases):
+        for by in ("band", "industry_group"):
+            tables[f"summary_by_{by}"] = summarize_backtest(cases, by=[by])
+        cases = cases.assign(n_bucket=pd.cut(cases["n_bidders"], [0, 30, 100, 300, 1000, 1e9]).astype(str))
+        tables["summary_by_n_bucket"] = summarize_backtest(cases, by=["n_bucket"])
+    else:
+        print("[warn] 평가 가능한 공고가 없습니다(기간·학습자료를 확인하십시오).")
+    print(summ.T.to_string())
+    _save_tables(tables, args.out)
+    return summ
+
+
+def cmd_consult(args, df=None, pb=None, bt=None) -> None:
+    from pathlib import Path
+
+    from .consult import consult, write_consult
+
+    df = _load_cbf(args.cbf, args.sheet) if df is None else df
+    pb = _load_prebid_opt(args.prebid_dir) if pb is None else pb
+    if bt is None and args.backtest:
+        p = Path(args.backtest)
+        p = p / "summary.csv" if p.is_dir() else p
+        bt = pd.read_csv(p, encoding="utf-8-sig")
+    tables = consult(df, pb, notices=args.notice, lam=args.lam, backtest_summary=bt)
+    paths = write_consult(tables, args.out)
+    cols = [c for c in ("공고번호", "발주기관", "예상업체수(중앙값)", "기본추천_사정율", "기본추천_투찰금액", "기본추천_낙찰확률",
+                        "대안_사정율", "대안_중앙값대비", "비고")
+            if c in tables["요약"].columns]
+    print(tables["요약"][cols].to_string(index=False))
+    print(f"[ok] {paths['xlsx']}\n[ok] {paths['md']}")
+
+
+def cmd_run_all(args) -> None:
+    """CBF·복수예가를 한 번만 읽고 감사 -> (백테스트) -> 컨설팅 보고서를 순서대로 만든다."""
+    import copy
+    from pathlib import Path
+
+    out = Path(args.out)
+    df = _load_cbf(args.cbf, args.sheet)
+    pb = _load_prebid_opt(args.prebid_dir)
+    a = copy.copy(args)
+    a.out = str(out / "1_cbf_audit")
+    cmd_cbf_audit(a, df)
+    bt = None
+    if not args.skip_backtest:
+        a = copy.copy(args)
+        a.out, a.end, a.max_cases = str(out / "2_backtest"), None, args.max_cases
+        bt = cmd_backtest(a, df, pb)
+    a = copy.copy(args)
+    a.out, a.notice, a.backtest = str(out / "3_consult"), args.notice, None
+    cmd_consult(a, df, pb, bt)
 
 
 def main(argv=None) -> None:
@@ -123,7 +258,8 @@ def main(argv=None) -> None:
     b.add_argument("--lower-rate", type=float, required=True, help="낙찰하한율(%%)")
     b.add_argument("--a-value", type=float, default=0.0)
     b.add_argument("--net-cost", type=float, default=None, help="순공사원가(원)")
-    b.add_argument("--net-cost-scaled", action="store_true", help="순공사원가 98%%에 사정율을 곱함(공고·예규 확인 후)")
+    b.add_argument("--net-cost-unscaled", action="store_true",
+                   help="순공사원가 98%%에 사정율을 곱하지 않음(기본은 곱함: 실데이터 1순위 27건 중 26건이 사정율 반영 기준 준수)")
     b.add_argument("--rounding", default="CEIL", choices=["CEIL", "HALF_UP", "FLOOR"])
     b.add_argument("--rate", type=float, required=True, help="가정 사정율(0기준 %%)")
     b.set_defaults(fn=cmd_bid)
@@ -144,6 +280,46 @@ def main(argv=None) -> None:
     n.add_argument("--prior", type=float, default=0.44)
     n.add_argument("--trials", type=int, default=3000)
     n.set_defaults(fn=cmd_nulltest)
+
+    c = sub.add_parser("cbf-audit", help="CBF 데이터 품질·산식 검증·경쟁사 모형")
+    c.add_argument("--cbf", required=True)
+    c.add_argument("--sheet", default="통합데이터")
+    c.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
+    c.add_argument("--out", default="cbf_audit")
+    c.set_defaults(fn=cmd_cbf_audit)
+
+    t = sub.add_parser("backtest", help="시간순 전략 백테스트(실제 1순위 금액과 비교)")
+    t.add_argument("--cbf", required=True)
+    t.add_argument("--sheet", default="통합데이터")
+    t.add_argument("--prebid-dir", default=None)
+    t.add_argument("--start", default="2025-07-01")
+    t.add_argument("--end", default=None)
+    t.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
+    t.add_argument("--max-cases", type=int, default=None)
+    t.add_argument("--out", default="backtest_out")
+    t.set_defaults(fn=cmd_backtest)
+
+    k = sub.add_parser("consult", help="개찰 전 공고 컨설팅 보고서(Excel/Markdown)")
+    k.add_argument("--cbf", required=True)
+    k.add_argument("--sheet", default="통합데이터")
+    k.add_argument("--prebid-dir", default=None)
+    k.add_argument("--notice", nargs="*", default=None, help="공고번호(생략 시 개찰 전 전체)")
+    k.add_argument("--backtest", default=None, help="backtest 출력 폴더 또는 summary.csv")
+    k.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
+    k.add_argument("--out", default="consult_out")
+    k.set_defaults(fn=cmd_consult)
+
+    ra = sub.add_parser("run-all", help="감사 + 백테스트 + 컨설팅 보고서 한 번에")
+    ra.add_argument("--cbf", required=True)
+    ra.add_argument("--sheet", default="통합데이터")
+    ra.add_argument("--prebid-dir", default=None)
+    ra.add_argument("--notice", nargs="*", default=None)
+    ra.add_argument("--start", default="2025-07-01")
+    ra.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
+    ra.add_argument("--max-cases", type=int, default=None)
+    ra.add_argument("--skip-backtest", action="store_true", help="백테스트 생략(수 분 단축)")
+    ra.add_argument("--out", default="nara_bid_stat_out")
+    ra.set_defaults(fn=cmd_run_all)
 
     args = ap.parse_args(argv)
     np.set_printoptions(suppress=True)

@@ -107,6 +107,33 @@ def binom_test_greater(k: int, n: int, p0: float) -> float:
     return float(min(1.0, math.exp(m) * sum(math.exp(v - m) for v in logs)))
 
 
+def poisson_binomial_cdf(p, k: int) -> float:
+    """독립 베르누이 합 W = sum(Bernoulli(p_i)) 의 P(W <= k) (정확, O(n k) 동적계획)."""
+    p = np.clip(np.asarray(p, dtype=float), 0.0, 1.0)
+    p = p[np.isfinite(p)]
+    if k < 0:
+        return 0.0
+    k = int(k)
+    if k >= len(p):
+        return 1.0
+    dp = np.zeros(k + 1)
+    dp[0] = 1.0
+    for pi in p:
+        dp[1:] = dp[1:] * (1 - pi) + dp[:-1] * pi
+        dp[0] *= 1 - pi
+    return float(min(1.0, dp.sum()))
+
+
+def poisson_binomial_test(wins: int, p) -> dict:
+    """관측 낙찰 수가 확률벡터 p 의 기대와 다른지 정확 양측검정(낙찰이 드물어도 유효)."""
+    p = np.asarray(p, dtype=float)
+    p = p[np.isfinite(p)]
+    lo = poisson_binomial_cdf(p, wins)          # P(W <= w)
+    hi = 1.0 - poisson_binomial_cdf(p, wins - 1)  # P(W >= w)
+    return {"expected": float(p.sum()), "observed": int(wins), "p_low": lo, "p_high": hi,
+            "p_two_sided": float(min(1.0, 2 * min(lo, hi)))}
+
+
 def normal_sf(z: float) -> float:
     return 0.5 * math.erfc(z / math.sqrt(2.0))
 
