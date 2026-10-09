@@ -78,6 +78,18 @@ def cmd_bid(args) -> None:
     print(json.dumps(bid_for_assumed_rate(args.base, args.rate, rule), ensure_ascii=False, indent=2))
 
 
+def read_rate_csv(path) -> tuple[np.ndarray, int]:
+    """경쟁사 사정율 CSV(컬럼 rate, 없으면 첫 컬럼) -> (숫자 사정율 배열, 제외한 행 수). UTF-8/cp949, 천단위 쉼표 허용."""
+    try:
+        comp = pd.read_csv(path, encoding="utf-8-sig", thousands=",")
+    except UnicodeDecodeError:  # Excel 에서 저장한 한글 CSV
+        comp = pd.read_csv(path, encoding="cp949", thousands=",")
+    col = "rate" if "rate" in comp.columns else comp.columns[0]
+    rates = pd.to_numeric(comp[col], errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(rates)
+    return rates[ok], int((~ok).sum())
+
+
 def cmd_winprob(args) -> None:
     from .bid import best_rates, win_probability_curve
     from .data import P_COLS
@@ -85,10 +97,11 @@ def cmd_winprob(args) -> None:
 
     h = _history(args)
     dist = RateDistribution.from_prebid_history(h[P_COLS].to_numpy(dtype=float), recent=args.recent)
-    comp = pd.read_csv(args.competitors)
-    col = "rate" if "rate" in comp.columns else comp.columns[0]
-    curve = win_probability_curve(dist, comp[col].to_numpy(dtype=float), args.n)
-    print(f"경쟁사 표본 {len(comp)}개, 참여사 수 가정 {args.n}")
+    rates, n_bad = read_rate_csv(args.competitors)
+    if not len(rates) and args.n > 0:
+        raise SystemExit(f"경쟁사 CSV 에 숫자 사정율이 없습니다: {args.competitors}")
+    curve = win_probability_curve(dist, rates, args.n)
+    print(f"경쟁사 표본 {len(rates)}개(숫자 아닌 값 {n_bad}개 제외), 참여사 수 가정 {args.n}")
     print("(정렬 기준: contested_prob = 다른 유효 투찰이 있을 때의 낙찰확률. sole_prob 는 나만 유효한 경우로 검증 불가)")
     print(best_rates(curve, k=args.top).to_string(index=False))
     n = args.n
@@ -104,6 +117,13 @@ def cmd_nulltest(args) -> None:
                           ("strict_gate(권장)", strict_gate(args.prior), max(args.cases, 600))):
         r = null_tuning_simulation(gate, n_cases=n, prior_positive=args.prior, trials=args.trials)
         print(f"{name:32s} 사례 {n:4d}건: 무정보 모델 통과율 {r['fire_rate']:.1%}, 통과 시 보고 정확도 {r['mean_reported_accuracy_when_fired']:.3f}")
+
+
+def _nonneg_int(v: str) -> int:
+    x = int(v)
+    if x < 0:
+        raise argparse.ArgumentTypeError("0 이상의 정수여야 합니다")
+    return x
 
 
 def _lam_arg(v: str):
@@ -203,10 +223,10 @@ def cmd_consult(args, df=None, pb=None, bt=None) -> None:
         p = Path(args.backtest)
         p = p / "summary.csv" if p.is_dir() else p
         bt = pd.read_csv(p, encoding="utf-8-sig")
-    tables = consult(df, pb, notices=args.notice, lam=args.lam, backtest_summary=bt)
+    tables = consult(df, pb, notices=args.notice, lam=args.lam, backtest_summary=bt, n_boot=args.n_boot)
     paths = write_consult(tables, args.out)
     cols = [c for c in ("공고번호", "발주기관", "예상업체수(중앙값)", "기본추천_사정율", "기본추천_투찰금액", "기본추천_낙찰확률",
-                        "대안_사정율", "대안_중앙값대비", "비고")
+                        "대안_사정율", "대안_중앙값대비(보정)", "비고")
             if c in tables["요약"].columns]
     print(tables["요약"][cols].to_string(index=False))
     print(f"[ok] {paths['xlsx']}\n[ok] {paths['md']}")
@@ -270,7 +290,7 @@ def main(argv=None) -> None:
     w.add_argument("--asof", default=None)
     w.add_argument("--recent", type=int, default=60)
     w.add_argument("--competitors", required=True, help="경쟁사 가정 사정율 CSV(컬럼 rate)")
-    w.add_argument("--n", type=int, required=True, help="예상 참여업체 수(본인 제외)")
+    w.add_argument("--n", type=_nonneg_int, required=True, help="예상 참여업체 수(본인 제외)")
     w.add_argument("--top", type=int, default=5)
     w.add_argument("--out", default=None)
     w.set_defaults(fn=cmd_winprob)
@@ -306,6 +326,7 @@ def main(argv=None) -> None:
     k.add_argument("--notice", nargs="*", default=None, help="공고번호(생략 시 개찰 전 전체)")
     k.add_argument("--backtest", default=None, help="backtest 출력 폴더 또는 summary.csv")
     k.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
+    k.add_argument("--n-boot", type=_nonneg_int, default=30, help="대안(경쟁사 모형) 낙찰확률 선택 편향 보정 부트스트랩 횟수(0: 대안 생략)")
     k.add_argument("--out", default="consult_out")
     k.set_defaults(fn=cmd_consult)
 
@@ -318,6 +339,7 @@ def main(argv=None) -> None:
     ra.add_argument("--lam", type=_lam_arg, default="auto", help="경쟁사 모형 평활 강도: auto(기본, 시간순 검증으로 선택) / null / 숫자")
     ra.add_argument("--max-cases", type=int, default=None)
     ra.add_argument("--skip-backtest", action="store_true", help="백테스트 생략(수 분 단축)")
+    ra.add_argument("--n-boot", type=_nonneg_int, default=30, help="대안(경쟁사 모형) 낙찰확률 선택 편향 보정 부트스트랩 횟수(0: 대안 생략)")
     ra.add_argument("--out", default="nara_bid_stat_out")
     ra.set_defaults(fn=cmd_run_all)
 

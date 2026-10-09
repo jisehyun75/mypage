@@ -419,3 +419,101 @@ class Round2RegressionTests(unittest.TestCase):
             r2.to_csv(p, index=False, encoding="cp949")
             df = load_cbf(p)
             self.assertEqual(int(df["base"].notna().sum()), len(raw))
+
+
+class Round3RegressionTests(unittest.TestCase):
+    def test_quadrature_independent_of_cell_offset(self):
+        from nara_bid_stat.bid import null_win_prob
+        from nara_bid_stat.competition import DistributionCompetitors, _base_for, null_competitor_model
+
+        for band, n in ((2.0, 30), (3.0, 3000), (2.0, 3000)):
+            F = _base_for(band)
+            C = DistributionCompetitors(F)
+            grid = float(F.quantile(0.5)) + np.arange(-0.3, 0.3, 0.0037)
+            c = win_probability_curve(F, C, n, grid=grid)
+            rel = c["cond_prob"].to_numpy() / null_win_prob(C.cdf_left(grid), n) - 1
+            self.assertLess(np.max(np.abs(rel)), 0.002, (band, n))
+            rec = recommend({"base": 1e8, "lower_rate": 87.745}, F, null_competitor_model(band), np.array([n]))
+            self.assertEqual(rec["best_rate"], rec["median_rate"], (band, n))  # 평평한 곡선 -> 중앙값
+
+    def test_competitors_for_gates_nonstandard_distribution(self):
+        from nara_bid_stat.competition import DistributionCompetitors, _base_for, null_competitor_model
+        from nara_bid_stat.strategy import competitors_for
+
+        df = standardize_cbf(make_raw_cbf(800, seed=21, sparse_keep=0.3))
+        g = df[gap_sample_mask(df) & df["band"].eq(3.0)]
+        m = fit_competitor_model(g["rate"], g["winner_rate"], g["n_bidders"], 3.0, lam=20.0)
+        self.assertIs(competitors_for(m, _base_for(3.0), 3.0), m)
+        other = RateDistribution.from_samples(np.linspace(-1, 1, 50), source="mechanism_bootstrap(recent=60)")
+        self.assertIsInstance(competitors_for(m, other, 3.0), DistributionCompetitors)
+        self.assertIsInstance(competitors_for(null_competitor_model(3.0), _base_for(3.0), 3.0), DistributionCompetitors)
+
+    def test_selection_bias_correction(self):
+        from nara_bid_stat.competition import _base_for, bootstrap_refits
+        from nara_bid_stat.strategy import selection_bias
+
+        df = standardize_cbf(make_raw_cbf(900, seed=22, sparse_keep=0.3))
+        g = df[gap_sample_mask(df)]
+        g3 = g[g["band"].eq(3.0)]
+        m = fit_competitor_model(g3["rate"], g3["winner_rate"], g3["n_bidders"], 3.0, lam=20.0)
+        refits = bootstrap_refits(g, 3.0, None, lam=20.0, n_boot=4, seed=1)
+        self.assertEqual(len(refits), 4)
+        sb = selection_bias({"base": 1e8, "lower_rate": 87.745}, _base_for(3.0), m, refits, np.array([20, 40]))
+        self.assertTrue(np.isfinite(sb["factor"]) and 0.8 < sb["factor"] < 1.5, sb)
+
+    def test_consult_missing_base_and_efficient_market_default(self):
+        from nara_bid_stat.strategy import efficient_market_probs
+
+        df = standardize_cbf(make_raw_cbf(700, seed=4, n_pending=2))
+        pend = df.index[df["status"].eq("PENDING")]
+        df.loc[pend[0], "base"] = np.nan
+        tables = consult(df, None, top_k=3, n_boot=2)
+        s = tables["요약"].set_index("공고번호")
+        r = s.loc[df.loc[pend[0], "notice"]]
+        self.assertTrue(np.isfinite(r["기본추천_사정율"]))
+        self.assertTrue(pd.isna(r["기본추천_투찰금액"]))
+        self.assertIn("투찰금액 미제공", r["비고"])
+        r2 = s.loc[df.loc[pend[1], "notice"]]
+        ns, _ = BidderCountSampler(df).sample(df.loc[pend[1], "org"], df.loc[pend[1], "industry_group"],
+                                              df.loc[pend[1], "band"], df.loc[pend[1], "base"], df.loc[pend[1], "date"])
+        self.assertAlmostEqual(r2["기본추천_낙찰확률"], efficient_market_probs(ns)["median"], places=12)
+        self.assertGreaterEqual(r2["기본추천_낙찰확률"], r2["무작위_낙찰확률"])
+
+    def test_backtest_keeps_band_without_model(self):
+        df = standardize_cbf(make_raw_cbf(900, seed=23))
+        win = (df["date"] >= "2026-03-01") & (df["date"] < "2026-04-01") & df["band"].eq(2.0)
+        df.loc[win, "band"] = 2.5  # 학습 자료가 없는 예가변동폭
+        cases = strategy_backtest(df, None, start="2026-03-01", end="2026-03-31")
+        sub = cases[cases["band"].eq(2.5)]
+        self.assertGreater(len(sub), 0)
+        self.assertTrue((sub["lam"] == "null(학습자료 부족)").all())
+        s = summarize_backtest(cases)
+        self.assertIn("n_sampler_vs_actual_ratio", s.columns)
+
+    def test_bidder_sampler_mixes_wider_level(self):
+        df = standardize_cbf(make_raw_cbf(900, seed=24))
+        r = df[df["status"].eq("COMPLETED")].iloc[-1]
+        v, label = BidderCountSampler(df).sample(r["org"], r["industry_group"], r["band"], r["base"], r["date"])
+        self.assertIn("비중 30%", label)
+        v0, _ = BidderCountSampler(df, pool_weight=0.0).sample(r["org"], r["industry_group"], r["band"], r["base"], r["date"])
+        self.assertLessEqual(len(v0), 30)
+        self.assertGreater(len(v), len(v0))
+
+    def test_rate_csv_reader(self):
+        from nara_bid_stat.__main__ import read_rate_csv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "c.csv"
+            p.write_bytes("사정율\n0.1\n-0.2\n\n abc\n0.5\n".encode("cp949"))
+            rates, bad = read_rate_csv(p)
+            np.testing.assert_allclose(rates, [0.1, -0.2, 0.5])
+            self.assertEqual(bad, 1)
+
+    def test_lambda_default_row_marked_chosen(self):
+        from nara_bid_stat.competition import select_lambda
+
+        df = standardize_cbf(make_raw_cbf(200, seed=25))
+        g = df[gap_sample_mask(df) & df["band"].eq(2.0)]
+        lam, t = select_lambda(g, 2.0, min_valid=10_000)
+        self.assertIsNone(lam)
+        self.assertTrue(bool(t["chosen"].iloc[0]))

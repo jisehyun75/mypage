@@ -36,7 +36,7 @@ from .bid import (
     win_probability_curve,
 )
 from .cbf import eval_sample_mask, gap_sample_mask, org_key
-from .competition import CompetitorModelSet, DistributionCompetitors, _base_for, fit_model_set
+from .competition import CompetitorModelSet, DistributionCompetitors, _base_for, fit_model_set, null_competitor_model
 from .data import P_COLS
 from .mechanism import KNOWN_SCHEMES, RateDistribution, identify_scheme
 
@@ -146,34 +146,59 @@ def learn_org_aliases(cbf: pd.DataFrame, prebid: pd.DataFrame, *, min_matches: i
 # 업체 수 N
 # ---------------------------------------------------------------------------
 class BidderCountSampler:
-    """비슷한 과거 공고의 업체수 표본."""
+    """비슷한 과거 공고의 업체수 표본.
 
-    def __init__(self, cbf: pd.DataFrame, *, k: int = 30, min_n: int = 10):
+    가장 비슷한 수준(기관·업종 -> 업종·변동폭·금액대 -> 업종·변동폭 -> 변동폭)의 최근 k건에,
+    업종·변동폭·금액대 수준의 최근 pool_k건을 pool_weight 비중으로 섞는다. 최근 30건만 쓰면 분포가 좁아
+    업체수가 예상보다 훨씬 적은(낙찰확률이 큰) 공고를 놓친다. 실데이터 2,360건(2025-07 ~ 2026-09) 비교:
+        예측 낙찰확률 5분위별 실제/예측  30건만 [2.04, 1.93, 1.20, 0.82, 1.09] -> 혼합 [1.34, 1.14, 1.05, 0.90, 1.21]
+        Brier 13.38e-4 -> 13.28e-4, 실제 업체수의 PIT 상위 10% 비율 13.6% -> 11.4%
+    같은 예가변동폭 전체를 섞으면 합계는 맞아 보여도 공고별 정확도가 나빠진다(Brier 14.4e-4).
+    합계 기준으로는 여전히 약 11% 낮게 예측한다(업체 2~5곳 공고가 드물고 미리 알기 어려움). 백테스트 요약의
+    n_sampler_vs_actual_ratio 로 확인한다.
+    """
+
+    def __init__(self, cbf: pd.DataFrame, *, k: int = 30, min_n: int = 10, pool_k: int = 200, pool_weight: float = 0.3):
         c = cbf[cbf["status"].eq("COMPLETED") & cbf["n_bidders"].ge(1) & cbf["date"].notna()].copy()
         c["_lb"] = np.log10(c["base"].clip(lower=1))
         self.c = c.sort_values("date", kind="mergesort").reset_index(drop=True)
         self.dates = self.c["date"].to_numpy("datetime64[ns]")
         self.k, self.min_n = k, min_n
+        self.pool_k, self.pool_weight = pool_k, float(pool_weight)
 
     def sample(self, org: str, industry_group: str, band: float, base: float, asof) -> tuple[np.ndarray, str]:
         n = int(np.searchsorted(self.dates, np.datetime64(pd.Timestamp(asof).normalize(), "ns"), side="left"))
         past = self.c.iloc[:n]
         key = org_key(org)
         lb = math.log10(base) if base and base > 0 else np.nan
+        same_band = past["band"].round(4) == round(band, 4)
+        ind_band = (past["industry_group"] == industry_group) & same_band
         levels = [
             ("동일기관·업종", (past["org_key"] == key) & (past["industry_group"] == industry_group)),
-            ("업종·변동폭·금액대", (past["industry_group"] == industry_group) & (past["band"].round(4) == round(band, 4))
-             & ((past["_lb"] - lb).abs() <= 0.3)),
-            ("업종·변동폭", (past["industry_group"] == industry_group) & (past["band"].round(4) == round(band, 4))),
-            ("변동폭", past["band"].round(4) == round(band, 4)),
+            ("업종·변동폭·금액대", ind_band & ((past["_lb"] - lb).abs() <= 0.3)),
+            ("업종·변동폭", ind_band),
+            ("변동폭", same_band),
             ("전체", pd.Series(True, index=past.index)),
         ]
+        local = None
         for label, m in levels:
             v = past.loc[m, "n_bidders"].to_numpy(float)
             if len(v) >= self.min_n:
-                return v[-self.k:], f"{label} {min(len(v), self.k)}건"
-        v = past["n_bidders"].to_numpy(float)
-        return (v[-self.k:] if len(v) else np.array([50.0])), "기본값"
+                local, llabel = v[-self.k:], f"{label} {min(len(v), self.k)}건"
+                break
+        if local is None:
+            v = past["n_bidders"].to_numpy(float)
+            return (v[-self.k:] if len(v) else np.array([50.0])), "기본값"
+        if self.pool_weight <= 0:
+            return local, llabel
+        for label, m in levels[1:4]:
+            pool = past.loc[m, "n_bidders"].to_numpy(float)
+            if len(pool) >= self.min_n:
+                pool = pool[-self.pool_k:]
+                # 표본 비중 = 지역 (1 - pool_weight) : 넓은 수준 pool_weight 가 되도록 지역 표본을 반복
+                rep = max(1, int(round(len(pool) * (1.0 - self.pool_weight) / (self.pool_weight * len(local)))))
+                return np.r_[np.repeat(local, rep), pool], f"{llabel} + {label} {len(pool)}건(비중 {self.pool_weight:.0%})"
+        return local, llabel
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +218,59 @@ def _rule_for(row) -> AwardRule | None:
 def _bid(base: float, x: float, rule: AwardRule) -> int:
     """가정 사정율 x 의 투찰금액 = max(하한가, 순공사원가 98% x (1+x)). 실제 사정율 <= x 이면 유효."""
     return bid_for_assumed_rate(base, x, rule)["bid"]
+
+
+def competitors_for(model, dist: RateDistribution, band: float):
+    """recommend 에 넘길 경쟁사 분포.
+
+    귀무모형이면 이 공고의 사정율 분포(효율적 시장의 정확한 귀무). 구조 있는 모형은 그 예가변동폭의 표준 규칙
+    (이론분포)을 기준으로 학습했으므로 공고의 사정율 분포가 바로 그 규칙일 때만 쓰고, 아니면 귀무로 바꾼다
+    (국방·한전처럼 규칙이 다른 기관에 적용하면 분포가 어긋난 구간이 가짜 '빈 구간'으로 보인다).
+    """
+    if model is None or model.lam is None:
+        return DistributionCompetitors(dist)
+    if not np.isfinite(band) or dist.source != _base_for(float(band)).source:
+        return DistributionCompetitors(dist, label="귀무(사정율 규칙이 모형 기준과 달라 경쟁사 모형 미적용)")
+    return model
+
+
+def efficient_market_probs(n_samples) -> dict:
+    """효율적 시장(경쟁사 = 사정율 분포)에서 업체수 표본 평균: 중앙값 (1-2^-N)/N, 무작위 선택 1/(N+2)."""
+    ns = np.asarray(n_samples, dtype=float)
+    ns = ns[np.isfinite(ns) & (ns >= 0)]
+    return {"median": float(np.mean(null_win_prob(0.5, ns))), "random": float(np.mean(1.0 / (ns + 2.0)))}
+
+
+def alternative_candidate(candidates: pd.DataFrame, median_rate: float, min_distance: float = 0.05):
+    """중앙값에서 min_distance 이상 떨어진 최상위 후보(없으면 None)."""
+    alt = candidates[(candidates["assumed_rate"] - median_rate).abs() >= min_distance]
+    return alt.iloc[0] if len(alt) else None
+
+
+def selection_bias(row, dist: RateDistribution, model, refits: Sequence, n_samples, *, top_k: int = 3,
+                   min_distance: float = 0.05) -> dict:
+    """대안 추천값의 선택 편향(부트스트랩).
+
+    추천은 적합된 곡선의 최댓값 위치를 고르고 같은 곡선으로 그 값을 보고하므로 낙찰확률이 위로 치우친다.
+    부트스트랩 모형 m_b 로 같은 절차를 돌려 고른 x_b 에서 r_b = (m_b 로 본 값) / (원래 모형으로 본 값)을 구하면
+    mean(r_b) 가 과대 배율의 추정치다. 보정값 = 보고값 / mean(r_b).
+    (lambda 선택 단계에서 생기는 추가 편향은 포함하지 않는다.)
+    """
+    nvals = np.atleast_1d(np.asarray(n_samples, dtype=float))
+    dens = rate_density_grid(dist, float(np.clip(0.02 / (np.nanmax(nvals) + 1.0), 2e-5, 2e-3)))
+    ratios = []
+    for mb in refits:
+        rb = recommend(row, dist, mb, n_samples, top_k=top_k)
+        a = alternative_candidate(rb["candidates"], rb["median_rate"], min_distance)
+        if a is None:
+            continue
+        pm = float(win_probability_curve(dist, model, n_samples, grid=[float(a["assumed_rate"])], density=dens)["cond_prob"].iloc[0])
+        if pm > 0:
+            ratios.append(float(a["cond_prob"]) / pm)
+    r = np.asarray(ratios, dtype=float)
+    if not len(r):
+        return {"factor": float("nan"), "n": 0, "lo": float("nan"), "hi": float("nan")}
+    return {"factor": float(r.mean()), "n": int(len(r)), "lo": float(np.quantile(r, 0.1)), "hi": float(np.quantile(r, 0.9))}
 
 
 def recommend(row: pd.Series | dict, dist: RateDistribution, competitors, n_samples: np.ndarray, *,
@@ -222,7 +300,8 @@ def recommend(row: pd.Series | dict, dist: RateDistribution, competitors, n_samp
     cell = np.r_[grid[0] - step / 2, (grid[:-1] + grid[1:]) / 2, grid[-1] + step / 2]
     mass = np.diff(dist.smooth_cdf(cell))
     random_cp = float((curve["cond_prob"].to_numpy() * mass).sum() / max(mass.sum(), 1e-12))
-    # 상위 후보를 촘촘히 다시 계산(같은 곡선의 최댓값을 그대로 쓰지 않음)
+    # 상위 후보 주변을 촘촘히 다시 계산(격자 해상도 보정일 뿐, 같은 곡선에서 고르고 같은 곡선으로 보고하므로
+    # best_cond_prob 는 선택 편향만큼 위로 치우친다 -> selection_bias 로 보정)
     order = curve.sort_values("contested_prob", ascending=False)["assumed_rate"].to_numpy()
     seeds: list[float] = []
     for x in order:
@@ -331,6 +410,9 @@ def strategy_backtest(
         mode   : 사정율 분포 최빈 0.1 구간의 가운데
         random : x 를 사정율 분포대로 뽑을 때 실제로 이겼을 확률 = F(1순위) - F(실제)
     각 전략의 'null' 은 효율적 시장(경쟁사 = 사정율 분포)에서 그 x 의 기대 낙찰확률(1순위 존재 조건부)이다.
+    경쟁사 모형을 학습할 간격 자료가 부족한 예가변동폭은 귀무모형으로, 공고의 사정율 분포가 모형 기준 규칙과
+    다르면 그 공고의 분포를 경쟁사 분포로 써서(competitors_for) 평가 대상에서 빼지 않는다(lam 컬럼에 표시).
+    model_pred 는 고른 x 에서 같은 모형으로 읽은 값이라 선택 편향만큼 위로 치우친다(model_calib_p 로 확인).
     """
     df = cbf.copy()
     target = df[eval_sample_mask(df)].copy()
@@ -357,11 +439,13 @@ def strategy_backtest(
             progress(f"{month}: 학습 {len(train)}건, 평가 {len(tm)}건")
         for _, r in tm.iterrows():
             m = models.get(r["band"], r["industry_group"])
-            if m is None:
-                continue
+            no_model = m is None
+            if no_model:  # 학습 간격 자료가 min_band_obs 미만인 예가변동폭: 귀무(효율적 시장)로 평가
+                m = null_competitor_model(float(r["band"]))
             dist, src = resolver.distribution(r["org"], r["band"], r["date"])
             ns, nsrc = sampler.sample(r["org"], r["industry_group"], r["band"], r["base"], r["date"])
-            rec = recommend(r, dist, m, ns, top_k=3)
+            comp = competitors_for(m, dist, float(r["band"]))
+            rec = recommend(r, dist, comp, ns, top_k=3)
             y, x1 = float(r["rate"]), float(r["winner_rate"])
             band_real, band_pred, band_xs = _band_strategy(rec["curve"], y, x1)
             top_bucket = dist.bucket_table(0.1)[0]
@@ -374,7 +458,8 @@ def strategy_backtest(
                 "notice": r["notice"], "date": r["date"], "org": r["org"], "industry_group": r["industry_group"],
                 "band": r["band"], "n_bidders": n_act, "n_expected": rec["n_expected"],
                 "rate": y, "winner_rate": x1, "rate_source": src, "n_source": nsrc, "model": m.label,
-                "lam": "null" if m.lam is None else m.lam,
+                "lam": ("null(학습자료 부족)" if no_model else "null") if m.lam is None else (
+                    m.lam if comp is m else "null(규칙 불일치)"),
                 "model_rate": rec["best_rate"], "median_rate": rec["median_rate"], "mode_rate": x_mode,
                 "model_pred": rec["best_cond_prob"], "median_pred": rec["median_cond_prob"],
                 "random_pred": rec["random_cond_prob"], "model_sole_prob": rec["best_sole_prob"],
@@ -385,6 +470,8 @@ def strategy_backtest(
                 "random_realized": float(np.clip(np.diff(dist.smooth_cdf(np.array([y, x1])))[0], 0.0, 1.0)),
                 "null_model": float(nul[0]), "null_median": float(nul[1]), "null_mode": float(nul[2]),
                 "null_random": 1.0 / (n_act + 2.0), "null_best": float(null_win_prob(0.5, n_act)),
+                # 같은 효율적 시장 공식을 '업체수 표본'으로 평균(예측에 쓰는 N 분포의 보정 점검용)
+                "null_median_sampled_n": efficient_market_probs(ns)["median"],
             })
     return pd.DataFrame(rows)
 
@@ -409,6 +496,11 @@ def summarize_backtest(cases: pd.DataFrame, by: Sequence[str] = ()) -> pd.DataFr
         rec = {"n": n, "n_bidders_median": float(g["n_bidders"].median()) if n else np.nan,
                "random_expected_wins": base_exp, "random_null_expected": float(g["null_random"].sum()),
                "efficient_market_best_wins": float(g["null_best"].sum())}
+        if "null_median_sampled_n" in g:
+            # 업체수 표본 보정: 같은 효율적 시장 공식을 표본 N 과 실제 N 으로 계산한 기대 낙찰 수
+            rec["n_sampler_expected_median_wins"] = float(g["null_median_sampled_n"].sum())
+            rec["n_sampler_vs_actual_ratio"] = (rec["n_sampler_expected_median_wins"] / float(g["null_median"].sum())
+                                                if float(g["null_median"].sum()) > 0 else np.nan)
         if by:
             rec.update(dict(zip(by, key if isinstance(key, tuple) else (key,))))
         rec["detectable_lift"] = 1.0 + 2.8 / math.sqrt(base_exp) if base_exp > 0 else np.nan

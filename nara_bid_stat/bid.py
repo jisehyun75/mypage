@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Sequence
@@ -298,8 +299,17 @@ def win_probability_curve(
                 y = np.where(w > 0, y, yc[starts])
             gy = cdf(y) if cdf is not None else np.zeros_like(y)
             lg = np.log(np.clip(gy, 1e-300, 1.0))  # 단조 증가
-            levels[k] = (y, w, gy, lg, np.searchsorted(y, vu, side="right"))
-        y, w, gy, lg, cnt = levels[k]
+            # x 가 들어 있는 칸은 x 아래 부분만 센다(칸 전체를 넣거나 빼면 x 의 칸 안 위치에 따라
+            # 상대오차 ~ N f 칸폭/2 가 생겨 평평한 곡선에서도 가짜 최댓값이 나온다).
+            le = yc[starts] - step_fine / 2  # 칸 아래 경계
+            wd = np.diff(np.r_[le, yc[-1] + step_fine / 2])
+            jc = np.searchsorted(le, vu, side="right") - 1  # x 가 든 칸(-1: 분포 아래)
+            jcc = np.clip(jc, 0, len(le) - 1)
+            frac = np.where(jc >= 0, np.clip((vu - le[jcc]) / wd[jcc], 0.0, 1.0), 0.0)
+            ym = le[jcc] + frac * wd[jcc] / 2  # 칸 안에서 x 아래 부분의 가운데
+            gm = cdf(ym) if cdf is not None else np.zeros_like(ym)
+            levels[k] = (y, w, gy, lg, jc, frac, gm)
+        y, w, gy, lg, jc, frac, gm = levels[k]
         if n > 0:
             jl = int(np.searchsorted(lg, -700.0 / n, side="left"))  # gy^n 이 0 이 아닌 구간만
             p_none = float((w[jl:] * np.exp(n * lg[jl:])).sum())
@@ -309,12 +319,17 @@ def win_probability_curve(
         p_contest_mix += pw * p_c
         tot_n = np.zeros(len(grid))
         sole_n = np.zeros(len(grid))
-        for i, c in enumerate(cnt):
-            if c == 0:
+        for i, c in enumerate(jc):
+            if c < 0:
                 continue
+            pm = float(w[c]) * float(frac[i])  # x 가 든 칸 중 x 아래 부분의 질량
             if n == 0:
-                tot_n[i] = sole_n[i] = float(w[:c].sum())
+                tot_n[i] = sole_n[i] = float(w[:c].sum()) + pm
                 continue
+            if pm > 0:
+                dm = min(max(float(gx[i] - gm[i]), 0.0), 1.0 - 1e-15)
+                tot_n[i] = pm * math.exp(n * math.log1p(-dm))
+                sole_n[i] = pm * float(gm[i]) ** n
             # gy 는 단조이므로 기여가 e^-60 보다 큰 구간(d < 60/n)만 계산한다. 그 밖의 gy^n 도 그보다 작다.
             # (np.dot 대신 곱셈합: 멀티스레드 BLAS 의 동기화 비용을 피한다)
             j0 = int(np.searchsorted(gy, gx[i] - 60.0 / n, side="left"))
@@ -322,12 +337,12 @@ def win_probability_curve(
                 continue
             d = np.clip(gx[i] - gy[j0:c], 0.0, 1.0 - 1e-15)
             ww = w[j0:c]
-            tot_n[i] = float((ww * np.exp(n * np.log1p(-d))).sum())
-            sole_n[i] = float((ww * np.exp(n * lg[j0:c])).sum())
+            tot_n[i] += float((ww * np.exp(n * np.log1p(-d))).sum())
+            sole_n[i] += float((ww * np.exp(n * lg[j0:c])).sum())
         total += pw * tot_n
         sole += pw * sole_n
         cond += pw * np.clip(tot_n - sole_n, 0.0, None) / p_c  # 업체수 표본이 '1순위 있는 공고'에서 나왔으므로 조건부의 평균
-    valid = np.array([rate_cdf_on_grid(yc, wc, v) for v in vu])
+    valid = np.array([rate_cdf_on_grid(yc, wc, v, step_fine) for v in vu])
     contested = np.clip(total - sole, 0.0, None)
     out = pd.DataFrame({"assumed_rate": grid, "win_prob": total, "sole_prob": sole, "contested_prob": contested,
                         "cond_prob": cond, "valid_prob": valid})
@@ -335,8 +350,16 @@ def win_probability_curve(
     return out
 
 
-def rate_cdf_on_grid(yc: np.ndarray, wc: np.ndarray, x: float) -> float:
-    return float(wc[: np.searchsorted(yc, x, side="right")].sum())
+def rate_cdf_on_grid(yc: np.ndarray, wc: np.ndarray, x: float, step: float | None = None) -> float:
+    """등간격 칸(중심 yc, 질량 wc)의 P(Y <= x). step(칸폭)을 주면 x 가 든 칸은 x 아래 비율만 센다."""
+    if step is None:
+        return float(wc[: np.searchsorted(yc, x, side="right")].sum())
+    j = int(np.searchsorted(yc - step / 2, x, side="right")) - 1
+    if j < 0:
+        return 0.0
+    if j >= len(yc):
+        return float(wc.sum())
+    return float(wc[:j].sum() + wc[j] * min(max((x - (yc[j] - step / 2)) / step, 0.0), 1.0))
 
 
 def null_win_prob(f_x, n, *, conditional: bool = True):

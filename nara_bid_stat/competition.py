@@ -423,8 +423,9 @@ def select_lambda(g: pd.DataFrame, band: float, *, grid=LAMBDA_GRID, holdout: fl
                   min_z: float = 2.0) -> tuple[float | None, pd.DataFrame]:
     """시간순으로 앞 70% 로 적합하고 뒤 30% 의 1순위 간격 로그우도로 lambda 를 고른다(귀무모형 포함).
 
-    구조 있는 후보는 귀무모형 대비 '행별 로그우도 차이'의 평균이 표준오차의 min_z 배를 넘을 때만 채택한다
-    (여러 후보 중 최댓값을 그냥 고르면 구조가 없는 시장에서도 절반쯤 '구조 있음'을 고르기 때문).
+    각 구조 후보마다 귀무모형 대비 '행별 로그우도 차이'의 대응 z(평균/표준오차)를 구하고, z 가 가장 큰 후보를
+    z >= min_z 일 때만 채택한다(아니면 귀무모형). 검증 평균 로그우도가 가장 큰 후보가 아니라 귀무 대비 근거가
+    가장 확실한 후보를 고른다(여러 후보 중 최댓값을 그냥 고르면 구조가 없는 시장에서도 절반쯤 '구조 있음'을 고르기 때문).
     낙찰 결과가 아니라 '간격 예측'이라는 모형 자체의 목표로 고르므로 전략 성과를 보고 고르는 과적합을 피한다.
     검증 표본이 min_valid 보다 적으면 default(기본: 귀무모형)를 쓴다.
     """
@@ -433,6 +434,7 @@ def select_lambda(g: pd.DataFrame, band: float, *, grid=LAMBDA_GRID, holdout: fl
     tr, va = g.iloc[:k], g.iloc[k:]
     if len(va) < min_valid or len(tr) < min_valid:
         return default, pd.DataFrame([{"band": band, "lam": "null" if default is None else default,
+                                       "n_train": len(tr), "n_valid": len(va), "chosen": True,
                                        "note": f"검증 표본 부족({len(va)}건) -> 기본값"}])
     null = null_competitor_model(band, bins)
     ll0 = null.loglik_terms(va["rate"], np.minimum(va["winner_rate"], 2 * band - 1e-9), va["n_bidders"])
@@ -496,6 +498,31 @@ def fit_model_set(
                 prior_h=mb.h, label=f"±{band:g}/{seg}")
     selection = pd.concat([t for t in sel if len(t)], ignore_index=True) if any(len(t) for t in sel) else None
     return CompetitorModelSet(by_band, by_seg, selection)
+
+
+def bootstrap_refits(gaps: pd.DataFrame, band: float, industry_group: str | None, *, lam: float, mu: float = 0.5,
+                     bins: int = 80, n_boot: int = 30, seed: int = 0) -> list[CompetitorModel]:
+    """fit_model_set 과 같은 방식(같은 lam, 업종군 모형은 mu*4 로 예가변동폭 모형 쪽 수축)으로 학습 행을
+    복원추출해 다시 적합한 모형들. 추천값의 '선택 편향'(같은 모형으로 고르고 같은 모형으로 평가해 생기는 과대)을
+    부트스트랩으로 재는 데 쓴다. industry_group 이 None 이면 예가변동폭 모형."""
+    key = round(float(band), 4)
+    g = gaps[gaps["band"].round(4) == key]
+    if not len(g):
+        return []
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n_boot):
+        gb = g.iloc[rng.integers(0, len(g), len(g))]
+        mb = fit_competitor_model(gb["rate"], gb["winner_rate"], gb["n_bidders"], key, lam=lam, mu=mu, bins=bins,
+                                  label=f"±{key:g}")
+        if industry_group is not None:
+            gs = gb[gb["industry_group"] == industry_group]
+            if len(gs) < 10:
+                continue
+            mb = fit_competitor_model(gs["rate"], gs["winner_rate"], gs["n_bidders"], key, lam=lam, mu=mu * 4,
+                                      bins=bins, prior_h=mb.h, label=f"±{key:g}/{industry_group}")
+        out.append(mb)
+    return out
 
 
 def _local_ratio_mle(df_: np.ndarray, n: np.ndarray) -> float:
