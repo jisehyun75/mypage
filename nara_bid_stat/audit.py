@@ -128,22 +128,34 @@ def scheme_table(df: pd.DataFrame) -> pd.DataFrame:
     return t.groupby(["org", "scheme"]).size().unstack(fill_value=0)
 
 
-def regime_changes(df: pd.DataFrame, freq: str = "Q", min_share: float = 0.8) -> pd.DataFrame:
-    """기관별 분기 대표 서명(±범위/음수개수)이 바뀐 지점."""
+def regime_changes(df: pd.DataFrame, freq: str = "Q", min_share: float = 0.8, min_n: int = 5) -> pd.DataFrame:
+    """기관별 분기 대표 생성규칙이 바뀐 지점.
+
+    판별된 규칙명(EQ15_2 등)을 우선 쓰고, 판별되지 않으면 '±범위/음수개수' 서명을 쓴다.
+    (15등분 규칙은 0을 걸친 칸 때문에 음수 개수가 7/8로 자연스럽게 바뀌므로 서명만 쓰면 오탐이 난다.)
+    공고가 min_n 건 미만이거나 한 규칙이 min_share 미만인 분기는 건너뛰고,
+    안정된 분기끼리 규칙이 다를 때만 변경으로 기록한다.
+    """
+    x = df[P_COLS].to_numpy(dtype=float)
+    sch = identify_scheme(x)
+    sig = mechanism_signature(x)
     t = df[["org", "date"]].copy()
-    t["sig"] = mechanism_signature(df[P_COLS].to_numpy(dtype=float))
+    t["label"] = np.where(np.isin(sch, ["UNKNOWN", "AMBIGUOUS"]), sig, sch)
     t["period"] = t["date"].dt.to_period(freq)
     rows = []
     for org, g in t.groupby("org"):
-        prev = None
+        prev, prev_per = None, None
         for per, h in g.groupby("period"):
-            vc = h["sig"].value_counts()
-            sig, share = vc.index[0], vc.iloc[0] / len(h)
-            label = sig if share >= min_share else "MIXED"
+            if len(h) < min_n:
+                continue
+            vc = h["label"].value_counts()
+            if vc.iloc[0] / len(h) < min_share:
+                continue
+            label = vc.index[0]
             if prev is not None and label != prev:
-                rows.append({"org": org, "period": str(per), "from": prev, "to": label, "n_in_period": len(h)})
-            prev = label
-    return pd.DataFrame(rows)
+                rows.append({"org": org, "last_stable_period": str(prev_per), "period": str(per), "from": prev, "to": label, "n_in_period": len(h)})
+            prev, prev_per = label, per
+    return pd.DataFrame(rows, columns=["org", "last_stable_period", "period", "from", "to", "n_in_period"])
 
 
 def theory_vs_empirical(df: pd.DataFrame, n_sim: int = 200_000) -> pd.DataFrame:
