@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+audit_out/
+# 입찰 원본 데이터와 결과물은 저장소에 올리지 않음
+data/
+results/
+분석결과/
+nara_bid_stat_out/
+consult_out/
+backtest_out/
+cbf_audit/
+*.xlsx
+!tests/**/*.xlsx
